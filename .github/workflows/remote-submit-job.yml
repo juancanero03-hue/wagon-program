@@ -1,0 +1,25 @@
+name: remote-submit-job
+
+# Pide a OtterSec que compile desde el repo publico y verifique contra mainnet.
+# Solo lectura on-chain + llamada a la API de OtterSec; no firma nada.
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Instalar solana-verify
+        run: cargo install solana-verify --locked
+      - name: Ayuda del comando
+        run: solana-verify remote submit-job --help || true
+      - name: Submit remote job a OtterSec
+        run: |
+          set -x
+          solana-verify remote submit-job \
+            --program-id 2kZqCjGfKgVR8dUkv4PCogFsFgN3EoSSNX41HN1cBfBA \
+            --uploader 6YdqoAnM3498uyycJcSA7Pq2SXLrTk8UUB6L5voXnVyN \
+            -u https://api.mainnet-beta.solana.com 2>&1 || true
