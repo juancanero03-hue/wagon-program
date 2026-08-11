@@ -1,0 +1,31 @@
+name: export-pda-tx
+
+# Genera la transaccion (base58) que registra la verificacion on-chain. La firma
+# la autoridad de upgrade (el vault de Squads): se pega en Squads y se aprueba.
+# NO firma ni envia nada aqui: solo CONSTRUYE e imprime la tx. Se lanza a mano.
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Instalar solana-verify
+        run: cargo install solana-verify --locked
+      - name: Ayuda del comando (para ver los flags exactos)
+        run: solana-verify export-pda-tx --help || true
+      - name: Exportar la tx del PDA (base58)
+        run: |
+          set -x
+          solana-verify export-pda-tx \
+            https://github.com/juancanero03-hue/wagon-program \
+            --program-id 2kZqCjGfKgVR8dUkv4PCogFsFgN3EoSSNX41HN1cBfBA \
+            --uploader 6YdqoAnM3498uyycJcSA7Pq2SXLrTk8UUB6L5voXnVyN \
+            --library-name wagon \
+            --commit-hash 9cd2b3c68c81c38fb00bacfb412675d3c31d0d82 \
+            --encoding base58 \
+            -u https://api.mainnet-beta.solana.com || true
