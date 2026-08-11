@@ -1,0 +1,32 @@
+name: verify-reproducibility
+
+# Comprueba que ESTE espejo (root = workspace) reproduce el binario de mainnet.
+# Solo lectura de mainnet (get-program-hash). Lanzar: Actions -> Run workflow.
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  reproducibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Instalar solana-verify
+        run: cargo install solana-verify --locked
+      - name: Build reproducible (Docker)
+        run: solana-verify build --library-name wagon
+      - name: Comparar hashes (build vs mainnet)
+        run: |
+          set -euo pipefail
+          BUILD_HASH=$(solana-verify get-executable-hash target/deploy/wagon.so)
+          ONCHAIN_HASH=$(solana-verify get-program-hash -u https://api.mainnet-beta.solana.com 2kZqCjGfKgVR8dUkv4PCogFsFgN3EoSSNX41HN1cBfBA)
+          echo "BUILD_HASH=$BUILD_HASH"
+          echo "ONCHAIN_HASH=$ONCHAIN_HASH"
+          if [ "$BUILD_HASH" = "$ONCHAIN_HASH" ]; then
+            echo "RESULTADO: MATCH -> el espejo reproduce el binario de mainnet."
+          else
+            echo "RESULTADO: MISMATCH -> el espejo NO reproduce; revisar contenido."
+            exit 1
+          fi

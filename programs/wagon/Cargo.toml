@@ -1,0 +1,26 @@
+[package]
+name = "wagon"
+version = "0.1.0"
+description = "Wagon vault marketplace program"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "wagon"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+# Swaps JUPITER_PROGRAM_ID and USDC_MINT to test fixtures so deposit/withdraw
+# can run against a local validator. Never enable in production builds.
+mock-jupiter = []
+
+[dependencies]
+anchor-lang = { version = "0.30.1", features = ["init-if-needed"] }
+anchor-spl = { version = "0.30.1", features = ["token"] }
+solana-program = "1.18.22"
+pyth-solana-receiver-sdk = "=0.6.1"

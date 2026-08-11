@@ -1,0 +1,137 @@
+[toolchain]
+anchor_version = "0.30.1"
+solana_version = "1.18.22"
+
+[features]
+resolution = true
+skip-lint = false
+
+# Program IDs. `wagon` matches `declare_id!` in programs/wagon/src/lib.rs —
+# fresh keypair (2026-04-24) used for both devnet and mainnet. Source keypair
+# stored outside the repo; upgrade authority on mainnet will be transferred
+# to the Squads multisig vault (Wagon Protocol, 2-of-3) before raising the
+# TVL cap beyond bootstrap.
+# `mock_jupiter` matches `declare_id!` in programs/mock-jupiter/src/lib.rs; it
+# is deployed only on localnet (never devnet/mainnet) and is used by the
+# deposit/withdraw test suite when the wagon program is built with
+# `--features mock-jupiter`.
+[programs.localnet]
+wagon = "2kZqCjGfKgVR8dUkv4PCogFsFgN3EoSSNX41HN1cBfBA"
+mock_jupiter = "5XTrg9h1vGodDJv71xtv8ghvcVk5vWCaCuxGAi8ZmGww"
+
+[programs.devnet]
+wagon = "2kZqCjGfKgVR8dUkv4PCogFsFgN3EoSSNX41HN1cBfBA"
+
+[programs.mainnet]
+wagon = "2kZqCjGfKgVR8dUkv4PCogFsFgN3EoSSNX41HN1cBfBA"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "localnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+# Mocha runs all tests; `ts-mocha` transpiles on the fly, no build step needed.
+# The mock-jupiter-gated suites (04_deposit, 05_withdraw) read
+# `WAGON_MOCK_JUPITER=1` to switch TS-side USDC/Jupiter constants to the
+# fixture addresses. The on-chain wagon program must be built with the
+# matching `--features mock-jupiter` — do that via `anchor test
+# --skip-deploy -- --features mock-jupiter`, or run `cargo build-sbf
+# --features mock-jupiter` and `solana program deploy` manually before
+# `anchor run test`.
+test = "npx ts-mocha -p ./tsconfig.json -t 1000000 'tests/**/*.ts'"
+# One-off ops script: seeds the allowed-mint registry with the Top 20 xStocks.
+# Idempotent (already-present mints are skipped). Before running against any
+# live cluster, edit `migrations/seed-allowed-mints.ts` and replace the
+# PLACEHOLDER entries with the real Backed Solana mint addresses from
+# https://backed.fi. In Phase 5 (Squads multisig) this must be routed as a
+# proposal — the authority signer is the protocol authority, not a dev key.
+seed-allowed-mints = "npx ts-node migrations/seed-allowed-mints.ts"
+
+[test]
+startup_wait = 15000
+shutdown_wait = 2000
+upgradeable = false
+
+[test.validator]
+# Clone mainnet state so USDC mint / Jupiter program exist on our local
+# validator in non-mock runs. When running the mock-jupiter suites the
+# clones are unused (the suites create a fresh test USDC mint and deploy
+# the mock-jupiter .so themselves, controlled via `WAGON_MOCK_JUPITER=1`).
+url = "https://api.mainnet-beta.solana.com"
+
+[[test.validator.clone]]
+address = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"  # USDC mint
+
+[[test.validator.clone]]
+address = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"  # Jupiter v6 program
+
+[[test.validator.clone]]
+address = "So11111111111111111111111111111111111111112"   # Wrapped SOL
+
+[[test.validator.clone]]
+address = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"  # Metaplex Token Metadata (create_vault CPI)
+
+[[test.validator.clone]]
+address = "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So"   # mSOL (basket fixture, null freeze auth -> passes Tier B)
+
+[[test.validator.clone]]
+address = "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1"   # bSOL (basket fixture, null freeze auth -> passes Tier B)
+
+# Upgrade #30 (mark-to-market): static PriceUpdateV2 fixtures owned by the
+# Pyth receiver program id. publish_time 2050 = always fresh (deterministic,
+# no pretest generator); the STALE one is 1970 = always stale. Built by
+# tests/_shared/fixtures/README note; layout mirrors pyth-solana-receiver-sdk
+# PriceUpdateV2 (borsh, VerificationLevel::Full).
+
+[[test.validator.account]]
+address = "GFyasSby5pD2Yqhc8EGH5Bi6atx573g98tKon4zYVaTv"  # pyth fixture A (price 2000, expo 0)
+filename = "tests/_shared/fixtures/pyth-a.json"
+
+[[test.validator.account]]
+address = "EXuyCcVwWEwgZCCLQGkyA4mpVUAchYC9kfLyrMbHmPna"  # pyth fixture B (price 500, expo 0)
+filename = "tests/_shared/fixtures/pyth-b.json"
+
+[[test.validator.account]]
+address = "BATzjGyVDgiVvUR5WvKTtsEo3HNZuSSG5GU8QK5GykZR"  # pyth fixture STALE (publish_time 1970)
+filename = "tests/_shared/fixtures/pyth-stale.json"
+
+[[test.validator.account]]
+address = "8TngsXnpdg5F6tCY57YSQSv4f9SGJtL87hLPyaDmVoZu"  # pyth fixture WIDE (conf 30%)
+filename = "tests/_shared/fixtures/pyth-wide.json"
+
+[[test.validator.account]]
+address = "3JXtGCRS7yF3becrEfefU5cSjQ8X7ZGZcNvoYMVzhqKn"  # pyth fixture SOL/USD (feed id REAL, price 100 USD expo -8)
+filename = "tests/_shared/fixtures/pyth-sol.json"
+
+# Ceremonia #40 (2026-07-29) — RECEPTOR DOBLE de Pyth. Las tres cuentas llevan
+# EXACTAMENTE los mismos 133 bytes (feed id sha256("wagon-test-feed:C40"),
+# precio 1500, expo 0, publish_time 2050 = fresca para siempre). Lo ÚNICO que
+# cambia entre ellas es el `owner`, que es justo lo que valida read_pyth_price:
+#   v1    -> receptor del SDK (rec5EK...), la generación VIEJA que hoy usa mainnet
+#   v2    -> receptor NUEVO (rec2HH...), al que Pyth movió sus cuentas de precio
+#   alien -> un tercer programa cualquiera: DEBE rechazarse (InvalidPriceAccount)
+# Sin la fixture v2 la CI saldría verde sin haber ejercitado nunca el receptor
+# nuevo, que es el motivo entero de esta ceremonia.
+
+[[test.validator.account]]
+address = "CTWSJYy5UJioUQ2zztx9z8cE7QhJAUxoKLqqEfwqF3RT"  # pyth C40 · receptor VIEJO (SDK)
+filename = "tests/_shared/fixtures/pyth-c40-v1.json"
+
+[[test.validator.account]]
+address = "FDvuYSSsPwP7sEhHCMEfLodaHxSQ6iUrbgnbLhrJgSNE"  # pyth C40 · receptor NUEVO
+filename = "tests/_shared/fixtures/pyth-c40-v2.json"
+
+[[test.validator.account]]
+address = "AsfWndgJ9PA3pwoGyhWLK528WBnta3roevouSdXFLSPp"  # pyth C40 · programa AJENO (debe fallar)
+filename = "tests/_shared/fixtures/pyth-c40-alien.json"
+
+
+# Retirada del AllowedMintRegistry (2026-07-03): copia byte a byte de la
+# cuenta REAL de mainnet (PDA [allowed-mints], 3.659 B, 26.357.520 lamports)
+# para testear close_allowed_mint_registry E2E — rent recuperado incluido.
+[[test.validator.account]]
+address = "2McC6VQbTRqnt4cmKayY7AZWJVKVfDLARj3vtbUbg5Pt"  # allowed-mint registry (muerto)
+filename = "tests/_shared/fixtures/allowed-mints.json"
