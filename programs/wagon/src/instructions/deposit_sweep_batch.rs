@@ -347,6 +347,16 @@ pub fn handler<'info>(
             vlayout::write_tvl_last_computed_usdc(&mut data, m2m)?;
         }
         let cur = vlayout::read_committed_deposits(&data)?;
+        // Ceremonia #51 (H-03): CANDADO DE SERIALIZACIÓN. Rechaza cometer si YA hay
+        // otra sesión comprometida (`committed_deposits != 0`) → a lo sumo UN depósito
+        // comprometido por vault a la vez. Es el veto de `deposit_init.rs:151` (que solo
+        // corre al INIT) reforzado también en el COMMIT, para que la re-marcación a
+        // mercado del precio en el commit (#50) opere siempre sobre un par
+        // (m2m, total_shares) consistente. `cur` es el valor PRE-incremento (esta sesión
+        // aún no ha comprometido) → cuenta solo OTRAS comprometidas. Reusa el MISMO error
+        // que el veto de init (la web ya lo mapea). El `deposit_settle` de la comprometida
+        // es permissionless → el rechazo es reintentable, nunca vara.
+        require!(cur == 0, WagonError::VaultHasCommittedDeposit);
         vlayout::write_committed_deposits(&mut data, cur.saturating_add(1))?;
 
         // ---- Ceremonia #44: reserva de participaciones fantasma (F3) --------
