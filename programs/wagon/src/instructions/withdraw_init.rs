@@ -233,7 +233,33 @@ pub fn handler<'info>(
 
     // ---- H-3: reservar la parte del inversor del idle USDC → hucha USDC ----
     let vault_usdc_before = read_token_amount(&ctx.accounts.vault_usdc_ata.to_account_info())?;
-    let usdc_slice_from_vault = mul_div_floor(vault_usdc_before, shares_to_burn, total_shares_before)?;
+    // Ceremonia 2026-08 (WA-01/WI-01/P2-1/P2-2): el slice de USDC ocioso usa el
+    // MISMO denominador aumentado que las patas de token (:336-351):
+    // `total_shares_before + pending_committed_shares + pending_burned_shares`.
+    // La valoración m2m que genera esas participaciones fantasma INCLUYE el USDC
+    // ocioso (pricing.rs `idle_usdc`), pero hasta ahora el ocioso se repartía con
+    // el denominador CRUDO → un retiro concurrente sobre-extraía cuando el ocioso
+    // superaba el peso de la pata USDC (depósito comprometido) o cuando un
+    // inyector volcaba valor de token a la USDC ociosa durante un retiro-abortado
+    // (`pending_burned>0`). Bajo el mismo denominador, el retiro toma s/(S+Pc+Pb)
+    // del AGREGADO (ocioso + tokens) sea cual sea el reparto de un inyector → nunca
+    // sobre-extrae. Los contadores son cotas superiores: en el denominador solo
+    // ENCOGEN el slice, jamás lo agrandan → nunca estrangula la salida. NO-OP con
+    // pending==0 (todo retiro normal). u128 inline, NUNCA `mul_div_floor` (que hace
+    // `u64::try_from` del DIVISOR y revertiría con S+Pc+Pb > u64::MAX — camino
+    // sagrado, cero reverts): aquí solo el resultado (≤ vault_usdc_before ≤ u64::MAX)
+    // va a u64.
+    let usdc_slice_from_vault = {
+        let denom = (total_shares_before as u128)
+            .checked_add(pending_committed_shares as u128)
+            .ok_or(WagonError::MathOverflow)?
+            .checked_add(pending_burned_shares as u128)
+            .ok_or(WagonError::MathOverflow)?; // denom >= total_shares_before > 0
+        let num = (vault_usdc_before as u128)
+            .checked_mul(shares_to_burn as u128)
+            .ok_or(WagonError::MathOverflow)?;
+        u64::try_from(num / denom).map_err(|_| error!(WagonError::MathOverflow))?
+    };
     if usdc_slice_from_vault > 0 {
         token::transfer(
             CpiContext::new_with_signer(

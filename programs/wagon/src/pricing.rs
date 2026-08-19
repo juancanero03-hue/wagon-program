@@ -299,8 +299,10 @@ pub fn compute_tvl_m2m_strict(
         // diluyera al que deposita. Se salta igual que la USDC — MISMO predicado y
         // MISMA posición que el bucle de valoración de abajo, o pair_count/k/
         // expected_len se desincronizan. Vaults reales (todas las patas peso>0) →
-        // byte-idéntico. rebalance/restructure ya prohíben peso 0 (#47, 6179), así
-        // que el único origen de una pata poblada-a-peso-0 es create + donación.
+        // byte-idéntico. Los TRES caminos que FINANCIAN una pata a peso 0 están
+        // vetados: `rebalance` (#47, 6179), `restructure_init` (#47, 6179) y
+        // `rebalance_swap` (ceremonia 2026-08, 6179) → el único origen de una pata
+        // poblada-a-peso-0 es create + donación directa (residual conocido).
         if mint == *usdc_mint || weight_bps == 0 {
             continue;
         }

@@ -122,6 +122,15 @@ pub fn handler<'info>(
     let dst_alloc = vault.allocations[d_idx];
     require!(!src_alloc.is_empty(), WagonError::RebalanceSwapSlotOutOfRange);
     require!(!dst_alloc.is_empty(), WagonError::RebalanceSwapSlotOutOfRange);
+    // Ceremonia 2026-08 (RSW-01/VL-02): el destino no puede ser una pata a peso 0.
+    // `!is_empty()` (mint!=default AND weight==0) deja pasar un slot con MINT REAL
+    // y peso 0, así que rebalance_swap era el TERCER camino (no cubierto por #47/#48
+    // en rebalance/restructure_init) para FINANCIAR una pata trivial con el dinero
+    // de los co-inversores: `pricing` la salta (TVL lee 0) y `withdraw_init` la marca
+    // trivial (el que sale quema shares y cobra ~0) = confiscación/rug. NO sobre
+    // `src_alloc`: el peso 0 como ORIGEN debe seguir permitido para sacar saldo
+    // donado (residual H3 conocido). Reusa el error 6179 del #47.
+    require!(dst_alloc.weight_bps >= 1, WagonError::ZeroWeightAllocation);
 
     require_keys_eq!(
         ctx.accounts.vault_source_ata.key(),

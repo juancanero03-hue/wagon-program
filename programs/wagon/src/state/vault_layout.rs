@@ -825,8 +825,26 @@ pub fn write_pending_burned_shares(data: &mut [u8], v: u64) -> Result<()> {
 /// Saturación a u64::MAX solo alcanzable con un vault auto-inflado a lo
 /// absurdo (autolesión): un P gigante solo encoge el propio slice, nunca revierte.
 pub fn phantom_shares(amount_usdc: u64, total_shares_before: u64, tvl_before: u64) -> u64 {
-    if total_shares_before == 0 || tvl_before == 0 {
+    if total_shares_before == 0 {
+        // residual F3 `tsb==0`: la FOTO se tomó con el vault VACÍO → sin titulares
+        // que proteger en el caso normal (ver comentario arriba).
         return 0;
+    }
+    // Ceremonia 2026-08 (VL-01): SEPARAR los dos ceros. El corto-circuito único
+    // `|| tvl_before == 0` apagaba la reserva anti-F3 AUNQUE hubiera shares vivas:
+    // con `m2m==0` (vault vaciado, alcanzable por restructure sell-all → abort) y
+    // `total_shares_before>0`, devolvía 0 → `pending_committed` no subía → un
+    // `withdraw_init` en la ventana commit→settle repartía el depósito en vuelo con
+    // denominador crudo. Con `tvl_before==0`, `deposit_settle` acuña por la rama
+    // BOOTSTRAP `base = value_in` shares (investor + dead, `value_in <= amount_usdc`).
+    // `amount_usdc` es COTA SUPERIOR de ese `base` (cubre las MIN_INITIAL_SHARES dead
+    // shares) → el denominador del retiro incluye al menos el aumento real de supply
+    // → el slice solo ENCOGE, nunca sobre-extrae ni estrangula. Retornar aquí también
+    // evita la división por cero de la línea de abajo. El par sweep(+P)/settle(−P)
+    // cuadra exacto: los 3 args son inmutables (la foto `tvl_before` se fija en el
+    // commit y no cambia hasta el settle) → ambos lados devuelven `amount_usdc`.
+    if tvl_before == 0 {
+        return amount_usdc;
     }
     let p = ((amount_usdc as u128) * (total_shares_before as u128)) / (tvl_before as u128);
     if p > u64::MAX as u128 {

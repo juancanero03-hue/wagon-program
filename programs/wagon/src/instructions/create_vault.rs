@@ -189,9 +189,11 @@ pub fn handler(ctx: Context<CreateVault>, args: CreateVaultArgs) -> Result<()> {
     // Ceremonia #47 (H3): AQUÍ NO se prohíbe el peso 0 A PROPÓSITO. El programa usa el
     // peso 0 como slot trivial/no financiado (suites 09/17 lo construyen). El PROTOCOLO
     // nunca financia una pata a peso 0 (deposit_swap_batch exige weight>0 y deposit_init
-    // la pre-marca trivial). #47 ESTRECHA H3 cerrando los dos caminos donde una pata
-    // queda FINANCIADA por el protocolo a peso 0: `rebalance` a 0 (pesos sin venta) y
-    // `restructure_init` con un mint que persiste en la cesta a peso 0.
+    // la pre-marca trivial). Los TRES caminos donde una pata podría quedar FINANCIADA por
+    // el protocolo a peso 0 están vetados: `rebalance` a 0 (pesos sin venta, #47) y
+    // `restructure_init` con un mint que persiste en la cesta a peso 0 (#47), y
+    // `rebalance_swap` con destino a peso 0 (ceremonia 2026-08, RSW-01/VL-02) — todos
+    // con err 6179.
     //
     // ✅ RESIDUAL H3 create+donación CERRADO en la CEREMONIA #48 (Opción B). Una pata a peso 0
     // puede recibir saldo por DONACIÓN directa a su ATA; hasta el #47 `compute_tvl_m2m_strict`
