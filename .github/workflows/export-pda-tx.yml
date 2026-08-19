@@ -26,6 +26,6 @@ jobs:
             --program-id 2kZqCjGfKgVR8dUkv4PCogFsFgN3EoSSNX41HN1cBfBA \
             --uploader 6YdqoAnM3498uyycJcSA7Pq2SXLrTk8UUB6L5voXnVyN \
             --library-name wagon \
-            --commit-hash 4f9c58671683ef654016ec968a2fddd22e639e08 \
+            --commit-hash 3df41d265653e37e766c54ad1cee1d979078a10a \
             --encoding base58 \
             -u https://api.mainnet-beta.solana.com || true
