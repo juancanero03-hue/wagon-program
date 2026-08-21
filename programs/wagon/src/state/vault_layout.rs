@@ -805,6 +805,79 @@ pub fn write_pending_burned_shares(data: &mut [u8], v: u64) -> Result<()> {
     Ok(())
 }
 
+// ---- ceremonia #53: bandera de VALOR FUERA DE TABLA (stranded) ---------------
+//
+// `stranded_flag` (u8 LE) de TRES estados: 0 = limpio; 1 = P2-3 PURO (el vault sostiene
+// valor fuera de tabla de un cambio de cesta abortado con compras, CON su
+// RestructureSession abierta como manifiesto); 2 = hay valor P2-4 (retiro-abort de un
+// mint eliminado, SIN manifiesto) — puro o MEZCLADO sobre un P2-3. AMBOS estados no-cero
+// bloquean SOLO la ENTRADA (`deposit_init` / el commit de `deposit_sweep_batch` /
+// `restructure_init` vetan con `flag != 0`); NINGÚN terminal de retiro lo lee → la salida
+// NUNCA se estrangula. Es ORTOGONAL al status → no se overloadea el status ni colisiona con
+// Paused. Se pone infalible en los DOS producers:
+//   - `restructure_abort` con compras GENUINAMENTE varadas (added_mask & buys_done) → 1.
+//   - `withdraw_sweep_batch` (dirección abort) que aterriza un mint pinneado con saldo>0
+//     que ya NO está en la tabla, desde status Active(0)/Paused(1) → 2 (SOBRESCRIBE un 1).
+// Limpieza según el estado:
+//   - `close_stranded` (permissionless): exige flag EXACTAMENTE 1 (P2-3 puro) y prueba la
+//     vacuidad del conjunto varado del manifiesto por IDENTIDAD (balance 0 en la ATA de
+//     CADA mint varado; inmune a decoy-donación: identidad, no un contador). El estado 2
+//     lo RECHAZA (no puede garantizar que no quede valor P2-4).
+//   - `admin_clear_stranded` (authority): limpia CUALQUIER estado no-cero (1 o 2). Reabrir
+//     la ENTRADA tras un P2-4 exige la firma de Squads (liveness, no seguridad; frecuencia ~0).
+// ⚠️ P2-3 y P2-4 NO son mutuamente excluyentes: un restructure puede ELIMINAR un mint (con
+// un retiro pinneado a él aún abierto) mientras la bandera está a 0, y ESE strand P2-4 (el
+// barrido de abort del retiro) puede caer DESPUÉS, coexistiendo con un manifiesto P2-3. El
+// estado 2 (que sobrescribe el 1) invalida a propósito la vía permissionless en ese caso →
+// obliga a `admin_clear_stranded`. Por eso la bandera es de 3 estados, no un solo bit.
+//
+// Almacenamiento: 1 byte en `allocations[5].reserved[2]` = offset absoluto 1036 (slot 5,
+// dentro de los 30 bytes ociosos de reserved[2..8] de los slots 5-9). Rango LIBRE:
+// `write_allocation` PRESERVA reserved[2..8], `write/clear_alloc_decimals` solo tocan
+// [0..2], `write_alloc_last_swap` vive en la COLA @1388, y `restructure_settle` PRESERVA
+// reserved[2..8] de todos los slots → la bandera SOBREVIVE a la reestructuración. LEN 1516
+// SIN cambio, sin migración: los 52 vaults leen 0 (create_account cebó a cero y ningún
+// handler pre-existente escribió @1036) → byte-idéntico hoy.
+
+pub const STRANDED_FLAG_OFFSET: usize = ALLOCATIONS_OFFSET + 5 * ALLOC_LEN + ALLOC_RESERVED_OFFSET + 2; // 1036
+
+const _: () = {
+    assert!(STRANDED_FLAG_OFFSET == 1036);
+    // Dentro del reserved del slot 5, NO solapa su caché de decimales [0..2].
+    assert!(STRANDED_FLAG_OFFSET + 1 <= ALLOCATIONS_OFFSET + 6 * ALLOC_LEN); // <= fin del slot 5 (1042)
+    // No solapa los contadores #43 (666) / #44 (740..746, 814..816) / #49 (888..894,
+    // 962..964), todos en slots 0-4, y cae antes de total_shares (1338).
+    assert!(STRANDED_FLAG_OFFSET > PENDING_BURNED_HI_OFFSET + 2);
+    assert!(STRANDED_FLAG_OFFSET + 1 <= TOTAL_SHARES_OFFSET);
+};
+
+pub fn read_stranded_flag(data: &[u8]) -> Result<u8> {
+    if data.len() < STRANDED_FLAG_OFFSET + 1 {
+        return err!(crate::errors::WagonError::VaultDataTooShort);
+    }
+    Ok(data[STRANDED_FLAG_OFFSET])
+}
+
+pub fn write_stranded_flag(data: &mut [u8], v: u8) -> Result<()> {
+    if data.len() < STRANDED_FLAG_OFFSET + 1 {
+        return err!(crate::errors::WagonError::VaultDataTooShort);
+    }
+    data[STRANDED_FLAG_OFFSET] = v;
+    Ok(())
+}
+
+/// Ceremonia #53: ¿está `mint` en la tabla de allocations viva? (recorre
+/// `0..allocation_count`). Usado por el land-and-mark de `withdraw_sweep_batch`.
+pub fn mint_in_allocations(data: &[u8], mint: &Pubkey) -> Result<bool> {
+    let n = read_allocation_count(data)? as usize;
+    for i in 0..n {
+        if read_allocation_mint(data, i)? == *mint {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Ceremonia #44 (F3): participaciones que un depósito COMPROMETIDO va a recibir
 /// al asentar, calculadas sobre las FOTOS INMUTABLES de la sesión (fijadas en
 /// `deposit_init`: `amount_usdc` [net del fee], `total_shares_before`,

@@ -294,6 +294,22 @@ pub mod wagon {
         instructions::restructure_abort::handler(ctx)
     }
 
+    /// Ceremonia #53: limpieza SELF-SERVICE (permissionless) del valor fuera de
+    /// tabla de un cambio de cesta abortado con compras (P2-3). Exige la ATA de cada
+    /// mint varado del manifiesto a 0 (rescatado) y baja la bandera stranded.
+    pub fn close_stranded<'info>(
+        ctx: Context<'_, '_, '_, 'info, CloseStranded<'info>>,
+    ) -> Result<()> {
+        instructions::close_stranded::handler(ctx)
+    }
+
+    /// Ceremonia #53: limpieza por AUTHORITY del valor fuera de tabla del lado
+    /// RETIRO (P2-4, sin manifiesto) y backstop de P2-3. Baja la bandera y cierra la
+    /// RestructureSession-manifiesto si viene.
+    pub fn admin_clear_stranded(ctx: Context<AdminClearStranded>) -> Result<()> {
+        instructions::admin_clear_stranded::handler(ctx)
+    }
+
     pub fn extend_feed_registry(ctx: Context<ExtendFeedRegistry>, extra_entries: u16) -> Result<()> {
         instructions::extend_feed_registry::handler(ctx, extra_entries)
     }

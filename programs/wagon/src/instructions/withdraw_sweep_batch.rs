@@ -167,6 +167,10 @@ pub fn handler<'info>(
     let shares_to_burn = session.shares_to_burn;
 
     let mut new_swept: u16 = 0;
+    // Ceremonia #53 (Fix 4): patas barridas con saldo REAL > 0 (las únicas que pueden
+    // dejar valor fuera de tabla). El land-and-mark de abajo solo mira estas para no
+    // cuarentenar la ENTRADA por una pata sin valor (falsa cuarentena / griefing).
+    let mut new_swept_funded: u16 = 0;
     for (pos, &leg_idx) in args.leg_indices.iter().enumerate() {
         require!(
             (leg_idx as usize) < (leg_count as usize),
@@ -226,6 +230,7 @@ pub fn handler<'info>(
                 amount,
                 decimals,
             )?;
+            new_swept_funded |= bit; // Ceremonia #53: solo esta pata movió valor real.
         }
         // Close the emptied escrow ATA; rent back to the investor.
         close_token_account_signed(&prog_ai, escrow_ai, &investor_ai, &session_ai, signer_seeds)?;
@@ -268,6 +273,64 @@ pub fn handler<'info>(
             cur.checked_add(shares_to_burn)
                 .ok_or(WagonError::MathOverflow)?,
         )?;
+    }
+
+    // ---- Ceremonia #53 (P2-4): land-and-mark --------------------------------
+    // Si en dirección abort se ha devuelto al vault el escrow de un mint que YA NO está
+    // en la tabla viva (un restructure lo eliminó mientras la sesión estaba abierta),
+    // ese valor queda FUERA DE TABLA. NO se VETA el barrido (vetarlo estrangularía un
+    // abort multi-lote: con la eliminación entre lotes, el 2º revertiría para siempre y
+    // congelaría el escrow del inversor). Se deja aterrizar (recuperable, como hoy) y se
+    // MARCA el vault para bloquear la ENTRADA hasta rescatarlo. Solo desde Active(0)/
+    // Paused(1): en Liquidating(2)/Closed(3) no hay depósitos (sin dilución) y marcar
+    // interferiría con finalize_close/sweep_to_usdc. USDC nunca queda fuera de tabla.
+    // SIN `require`/revert → la SALIDA procede idéntica (withdraw_abort re-acuña completo,
+    // sin doble pago). Se evalúa CADA barrido (el strand puede caer en cualquier lote, no
+    // solo en la transición aborting 0→1). Borrow: read y write en scopes separados, tras
+    // soltar el mut del bloque pending_burned. Sin manifiesto → se limpia con
+    // admin_clear_stranded (authority; el retiro no deja una RestructureSession).
+    if abort_direction && (guard.status == 0u8 || guard.status == 1u8) {
+        let stranded_here = {
+            let data = vault_ai.try_borrow_data()?;
+            let mut found = false;
+            for leg_idx in 0..(leg_count as usize) {
+                // Fix 4: solo patas con saldo REAL movido (new_swept_funded), no las
+                // barridas a 0 (evita cuarentena en falso por una pata sin valor).
+                if (new_swept_funded >> leg_idx) & 1 == 0 {
+                    continue;
+                }
+                let m = leg_mints[leg_idx];
+                if m == USDC_MINT {
+                    continue;
+                }
+                if !vlayout::mint_in_allocations(&data, &m)? {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if stranded_here {
+            {
+                // Ceremonia #53 (Fix 2): el strand del lado RETIRO marca el estado 2
+                // (P2-4), NO 1. La bandera es de DOS estados: 1 = solo P2-3 (con
+                // manifiesto, limpiable por `close_stranded` permissionless por
+                // identidad); 2 = hay valor P2-4 sin manifiesto (o mezclado sobre un P2-3)
+                // → solo `admin_clear_stranded` (authority) reabre. Escribir 2 sobre un 1
+                // vivo INVALIDA a propósito la vía permissionless: `close_stranded` exige
+                // ==1, así que un P2-4 concurrente sobre un manifiesto P2-3 fuerza la
+                // firma de Squads. Cierra la coexistencia P2-4-sobre-P2-3 (la premisa de
+                // «mutuamente excluyentes» era falsa: la eliminación del mint pudo ocurrir
+                // con la bandera a 0, antes del strand P2-3). Ambos estados vetan la ENTRADA.
+                let mut data = vault_ai.try_borrow_mut_data()?;
+                vlayout::write_stranded_flag(&mut data, 2)?;
+            }
+            emit!(crate::events::StrandedValueQuarantined {
+                vault: vault_key,
+                caller: ctx.accounts.caller.key(),
+                producer: 1,
+            });
+        }
     }
 
     Ok(())

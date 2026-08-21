@@ -116,9 +116,18 @@ pub fn handler<'info>(
 
     let session = &ctx.accounts.deposit_session;
     let now = Clock::get()?.unix_timestamp;
-    let stale = {
+    let (stale, dirty) = {
         let data = vault_ai.try_borrow_data()?;
-        session.created_at < vlayout::read_last_restructured_at(&data)?
+        (
+            session.created_at < vlayout::read_last_restructured_at(&data)?,
+            // Ceremonia #53: el vault sostiene valor FUERA DE TABLA → no COMMITear un
+            // depósito contra un TVL infravalorado. Fuerza el camino de ABORTO
+            // (reembolso EN ESPECIE al inversor), que hace `is_commit=false` → el
+            // re-precio S-1 del #50 y el incremento de committed NO corren. La entrada
+            // fresca ya la veta deposit_init; esto cubre una sesión en vuelo cuyo commit
+            // cae DENTRO de la ventana sucia (strand permissionless posterior a su init).
+            vlayout::read_stranded_flag(&data)? != 0,
+        )
     };
 
     // ---- Decide the direction ON-CHAIN -------------------------------------
@@ -137,6 +146,15 @@ pub fn handler<'info>(
     let abort_direction = session.aborting == 1
         || !session.is_complete()
         || stale
+        // Ceremonia #53: valor fuera de tabla → reembolsa (NO committea) SOLO una
+        // sesión FRESCA (legs_swept == 0). El `&& legs_swept == 0` es CRÍTICO (espejo
+        // del clause hermano del #42, abajo): un depósito YA COMPROMETIDO (legs_swept
+        // != 0) que reciba un strand entre lotes DEBE seguir asentando —su precio se
+        // fijó en el commit del lote 1 contra el TVL limpio pre-strand, sin dilución— y
+        // decrementar committed/pending; forzarlo a abort los dejaría CLAVADOS (los 3
+        // decrementadores exigen aborting==0) → brick + recorte permanente de toda
+        // salida = estrangular la salida. La ENTRADA fresca sigue bloqueada por dirty.
+        || (dirty && session.legs_swept == 0)
         || ((guard.status == 2u8 || guard.status == 3u8) && session.legs_swept == 0);
     if abort_direction {
         let timed_out = now.saturating_sub(session.created_at) > DEPOSIT_SESSION_TIMEOUT_SECS;

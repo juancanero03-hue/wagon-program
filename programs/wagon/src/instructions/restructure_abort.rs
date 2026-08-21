@@ -32,12 +32,15 @@ pub struct RestructureAbort<'info> {
     #[account(mut)]
     pub vault: UncheckedAccount<'info>,
 
+    // Ceremonia #53: SIN `close = caller`. Si el abort deja compras GENUINAMENTE
+    // varadas, la sesión se CONSERVA abierta como manifiesto exacto de lo fuera de
+    // tabla (la limpieza self-service `close_stranded` la cerrará al probar vacuidad);
+    // en la rama limpia (sin varados) se cierra a mano en el handler con Account::close.
     #[account(
         mut,
         seeds = [RESTRUCTURE_SEED, vault.key().as_ref()],
         bump = restructure_session.bump,
         has_one = vault @ WagonError::RestructureSessionMismatch,
-        close = caller,
     )]
     pub restructure_session: Box<Account<'info, RestructureSession>>,
 }
@@ -76,9 +79,35 @@ pub fn handler(ctx: Context<RestructureAbort>) -> Result<()> {
         );
     }
 
+    // Ceremonia #53: ¿el abort deja mints GENUINAMENTE varados (comprados, no-USDC y
+    // que NO están en la tabla VIEJA que el abort conserva)? Lecturas PURAS del vault
+    // y la sesión → el abort sigue sin poder revertir por causa externa (preserva la
+    // escotilla de emergencia). `stranded_mask` == `added_mask & buys_done` de settle.
+    let stranded_mask = {
+        let data = vault_ai.try_borrow_data()?;
+        session.stranded_mask(&data)?
+    };
+    let stranded = stranded_mask != 0;
+    let buys_done_nonzero = session.buys_done != 0;
+
     {
         let mut data = vault_ai.try_borrow_mut_data()?;
         vlayout::write_status(&mut data, 0u8 /* Active */)?;
+        // Ceremonia #53: si hay valor fuera de tabla, MARCA el vault (bloquea la
+        // ENTRADA; escritura infalible de 1 byte) y CONSERVA la sesión como manifiesto.
+        if stranded {
+            vlayout::write_stranded_flag(&mut data, 1)?;
+        }
+    }
+
+    // Ceremonia #53: rama LIMPIA (sin varados) → cerrar la sesión a mano (antes lo hacía
+    // el constraint `close = caller`). Account::close cambia el owner al system program
+    // → Anchor NO re-serializa la cuenta al exit (verificado: Account::exit guarda por
+    // owner). En la rama VARADA NO se cierra: queda como manifiesto para close_stranded.
+    if !stranded {
+        ctx.accounts
+            .restructure_session
+            .close(ctx.accounts.caller.to_account_info())?;
     }
 
     // H4 (ceremonia #45, N3): RETIRADO el refresco M-1 opcional de la caché de
@@ -96,7 +125,16 @@ pub fn handler(ctx: Context<RestructureAbort>) -> Result<()> {
     emit!(RestructureAborted {
         vault: ctx.accounts.vault.key(),
         caller: ctx.accounts.caller.key(),
-        stranded_buys: session.buys_done != 0,
+        stranded_buys: buys_done_nonzero,
     });
+    // Ceremonia #53: aviso preciso de cuarentena (solo si hay valor GENUINAMENTE fuera
+    // de tabla, más estricto que `stranded_buys`, que cuenta compras persistentes).
+    if stranded {
+        emit!(crate::events::StrandedValueQuarantined {
+            vault: ctx.accounts.vault.key(),
+            caller: ctx.accounts.caller.key(),
+            producer: 0,
+        });
+    }
     Ok(())
 }

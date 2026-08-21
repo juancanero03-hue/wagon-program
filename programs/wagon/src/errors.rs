@@ -398,4 +398,22 @@ pub enum WagonError {
     // la donación sería griefing; se revierte.
     #[msg("La prueba de congelación no es válida: ninguna cuenta de prueba está congelada.")]
     DepositForceReleaseNotFrozen = 6181,
+
+    // Ceremonia #53 — el vault sostiene VALOR FUERA DE TABLA (un token creado por
+    // un producer conocido: cambio de cesta abortado con compras, o retiro-abort de
+    // un mint eliminado). La ENTRADA queda vetada hasta rescatar ese valor y bajar la
+    // bandera (close_stranded permissionless, o admin_clear_stranded). La SALIDA sigue
+    // abierta. No es «reintenta»: exige limpieza. Reusa esta condición en deposit_init,
+    // el commit de deposit_sweep_batch y restructure_init.
+    #[msg("El vault tiene valor fuera de tabla pendiente de rescatar: los depósitos están en pausa hasta limpiarlo.")]
+    VaultHasStrandedValue = 6182,
+
+    // Ceremonia #53 — close_stranded exige que la ATA de cada mint varado del
+    // manifiesto esté a 0 (rescatada) antes de bajar la bandera.
+    #[msg("La cuenta del token varado aún no está vacía: rescátalo antes de limpiar.")]
+    StrandedAtaNotEmpty = 6183,
+
+    // Ceremonia #53 — close_stranded / admin_clear_stranded exigen la bandera puesta.
+    #[msg("El vault no tiene valor fuera de tabla marcado.")]
+    NotStranded = 6184,
 }

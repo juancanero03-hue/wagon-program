@@ -123,7 +123,7 @@ pub fn handler(ctx: Context<DepositInit>, args: DepositInitArgs) -> Result<()> {
     let (creator, nonce, vault_bump, status) =
         (guard.creator, guard.nonce, guard.bump, guard.status);
     let nonce_le = nonce.to_le_bytes();
-    let (allocation_count, total_shares_before, tvl_before, agg_cost_before, usdc_ata_pk, committed_deposits) = {
+    let (allocation_count, total_shares_before, tvl_before, agg_cost_before, usdc_ata_pk, committed_deposits, stranded_flag) = {
         let data = vault_ai.try_borrow_data()?;
         (
             vlayout::read_allocation_count(&data)?,
@@ -132,6 +132,7 @@ pub fn handler(ctx: Context<DepositInit>, args: DepositInitArgs) -> Result<()> {
             vlayout::read_aggregate_cost_basis_usdc(&data)?,
             vlayout::read_usdc_ata(&data)?,
             vlayout::read_committed_deposits(&data)?,
+            vlayout::read_stranded_flag(&data)?,
         )
     };
 
@@ -150,6 +151,18 @@ pub fn handler(ctx: Context<DepositInit>, args: DepositInitArgs) -> Result<()> {
     require!(
         committed_deposits == 0,
         WagonError::VaultHasCommittedDeposit
+    );
+
+    // ---- Ceremonia #53: veto con VALOR FUERA DE TABLA en el vault -------------
+    // Mientras la bandera stranded esté puesta, el vault sostiene un token que
+    // `compute_tvl_m2m_strict` NO ve (fuera de la tabla) → acuñar aquí daría
+    // participaciones de más contra un TVL infravalorado y diluiría a los holders
+    // previos cuando ese valor aflore (rescate → USDC ocioso). Fail-CLOSED antes de
+    // tocar un lamport. NO es bloqueo permanente: se limpia rescatando + close_stranded
+    // (permissionless) o admin_clear_stranded. El retiro NO se toca (la salida sigue).
+    require!(
+        stranded_flag == 0,
+        WagonError::VaultHasStrandedValue
     );
 
     // Bitmap caps at 16 legs; the session's leg_mints snapshot (F2b) caps

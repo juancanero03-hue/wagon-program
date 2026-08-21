@@ -12,7 +12,8 @@
 
 use anchor_lang::prelude::*;
 
-use crate::constants::MAX_TOKENS_PER_VAULT;
+use crate::constants::{MAX_TOKENS_PER_VAULT, USDC_MINT};
+use crate::state::vault_layout as vlayout;
 
 #[account]
 pub struct RestructureSession {
@@ -70,6 +71,40 @@ impl RestructureSession {
     }
     pub fn buys_complete(&self, new_non_usdc_mask: u16) -> bool {
         (self.buys_done & new_non_usdc_mask) == new_non_usdc_mask
+    }
+
+    /// Ceremonia #53: máscara (bits = índices de la cesta NUEVA) de los mints
+    /// GENUINAMENTE varados si esta sesión se aborta AHORA: comprados
+    /// (`buys_done`) Y no-USDC Y que NO están en la tabla VIEJA del vault (la que
+    /// el abort conserva). Es exactamente `added_mask & buys_done` de
+    /// `restructure_settle` (:111-116) pero SIN escribir la tabla → lecturas puras,
+    /// así el abort sigue sin poder revertir por causa externa. `restructure_init`
+    /// rechaza mints duplicados en la cesta nueva, así que cada bit es un mint
+    /// distinto con balance > 0 (una compra consumió USDC). `close_stranded` usa la
+    /// MISMA función → la máscara del veto y la de la limpieza coinciden byte a byte.
+    pub fn stranded_mask(&self, vault_data: &[u8]) -> Result<u16> {
+        let old_count = vlayout::read_allocation_count(vault_data)? as usize;
+        let mut mask = 0u16;
+        for i in 0..(self.new_count as usize) {
+            if (self.buys_done >> i) & 1 == 0 {
+                continue;
+            }
+            let m = self.new_mints[i];
+            if m == USDC_MINT {
+                continue;
+            }
+            let mut in_old = false;
+            for j in 0..old_count {
+                if vlayout::read_allocation_mint(vault_data, j)? == m {
+                    in_old = true;
+                    break;
+                }
+            }
+            if !in_old {
+                mask |= 1u16 << i;
+            }
+        }
+        Ok(mask)
     }
 }
 

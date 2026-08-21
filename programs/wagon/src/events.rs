@@ -201,6 +201,27 @@ pub struct RestructureAborted {
     pub stranded_buys: bool,
 }
 
+// ─── Ceremonia #53: valor fuera de tabla ───────────────────────────────────
+/// El vault entró en CUARENTENA (bandera stranded a 1) porque una operación dejó
+/// valor fuera de tabla. `producer`: 0 = restructure_abort con compras varadas,
+/// 1 = withdraw_sweep_batch de un mint eliminado. La ENTRADA queda vetada hasta limpiar.
+#[event]
+pub struct StrandedValueQuarantined {
+    pub vault: Pubkey,
+    pub caller: Pubkey,
+    pub producer: u8,
+}
+
+/// La bandera stranded volvió a 0: el valor fuera de tabla se rescató y la ENTRADA
+/// se reabre. `by_authority`: false = close_stranded permissionless (P2-3),
+/// true = admin_clear_stranded (P2-4 / backstop).
+#[event]
+pub struct StrandedValueCleared {
+    pub vault: Pubkey,
+    pub caller: Pubkey,
+    pub by_authority: bool,
+}
+
 // ─── Capa 5: fractional deposit/withdraw events ────────────────────────────
 
 #[event]

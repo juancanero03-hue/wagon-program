@@ -8,8 +8,10 @@
 //! `withdraw_*.rs`.
 
 pub mod admin;
+pub mod admin_clear_stranded;
 pub mod cache_alloc_decimals;
 pub mod claim_creator_rewards;
+pub mod close_stranded;
 pub mod extend_feed_registry;
 pub mod close_vault;
 pub mod create_vault;
@@ -43,6 +45,10 @@ pub mod withdraw_abort;
 #[allow(ambiguous_glob_reexports)]
 #[allow(ambiguous_glob_reexports)]
 pub use admin::*;
+#[allow(ambiguous_glob_reexports)]
+pub use admin_clear_stranded::*;
+#[allow(ambiguous_glob_reexports)]
+pub use close_stranded::*;
 #[allow(ambiguous_glob_reexports)]
 pub use cache_alloc_decimals::*;
 #[allow(ambiguous_glob_reexports)]

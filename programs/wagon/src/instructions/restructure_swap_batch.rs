@@ -152,6 +152,30 @@ pub fn handler<'info>(
             );
             session.new_mints[idx]
         };
+        // Ceremonia #53 (Fix 3): rechazar COMPRAR un mint que YA está en la tabla viva a
+        // PESO 0. Un slot peso-0 lo SALTA `compute_tvl_m2m_strict` (#48), así que
+        // financiarlo con una compra crea valor m2m-INVISIBLE que un abort deja EN la
+        // tabla (fuera del alcance de `stranded_mask`, que mira presencia no peso, y de
+        // `rescue_untracked_token`, que exige mint FUERA de la tabla) → un depósito acuñaría
+        // de más y, al re-tabular el slot a peso>0, se materializaría la dilución. Comprar
+        // un mint que persiste a peso 0 no tiene uso legítimo (para activarlo se elimina y
+        // se re-añade). Un mint NUEVO (fuera de la tabla vieja) NO se ve afectado → el flujo
+        // P2-3 normal sigue igual. Reusa 6179 (ZeroWeightAllocation).
+        if kind == 1 {
+            let mut in_old_zero_weight = false;
+            {
+                let data = vault_ai.try_borrow_data()?;
+                for j in 0..(old_count as usize) {
+                    if vlayout::read_allocation_mint(&data, j)? == expected_mint
+                        && vlayout::read_allocation_weight_bps(&data, j)? == 0
+                    {
+                        in_old_zero_weight = true;
+                        break;
+                    }
+                }
+            }
+            require!(!in_old_zero_weight, WagonError::ZeroWeightAllocation);
+        }
         let oracle_len = match guard_registry {
             Some(reg) => crate::pricing::guard_oracle_account_count(reg, &expected_mint)?,
             None => 0,

@@ -89,6 +89,15 @@ pub fn handler(ctx: Context<RestructureInit>, args: RestructureInitArgs) -> Resu
             vlayout::read_committed_deposits(&data)? == 0,
             WagonError::VaultHasCommittedDeposit
         );
+        // Ceremonia #53: no reestructurar con VALOR FUERA DE TABLA pendiente. Cierra
+        // la re-tabulación (que dejaría el contador/manifiesto descuadrado) y evita
+        // crear MÁS strand encima de uno vivo → P2-3 y P2-4 quedan mutuamente
+        // excluyentes. Defensa en profundidad: un abort con compras varadas deja la
+        // RestructureSession ABIERTA, y su PDA `init` ya colisiona aquí.
+        require!(
+            vlayout::read_stranded_flag(&data)? == 0,
+            WagonError::VaultHasStrandedValue
+        );
         vlayout::read_allocation_count(&data)?
     };
     require_keys_eq!(
