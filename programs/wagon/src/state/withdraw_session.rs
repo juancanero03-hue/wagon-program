@@ -48,6 +48,17 @@ pub const WITHDRAW_SESSION_TIMEOUT_SECS: i64 = 30 * 60;
 /// acción impone exposición a token al inversor, no destruye su valor.
 pub const WITHDRAW_INKIND_TIMEOUT_SECS: i64 = 24 * 60 * 60;
 
+/// Ceremonia #54 (DT-C): reloj EXTERIOR anidado sobre la válvula en especie. Un
+/// TERCERO (`caller != investor`) solo puede conducir el barrido en dirección
+/// ABORT de una sesión huérfana por encima de ESTE plazo — estrictamente mayor
+/// que `WITHDRAW_INKIND_TIMEOUT_SECS` (24 h) para que, en la ventana [24h, 48h],
+/// SOLO el inversor pueda actuar y nadie le arrebate el cobro en especie forzando
+/// `aborting = 1` (que veta `withdraw_claim_leg_in_kind`). El inversor conserva
+/// acceso a cualquier hora. Sustituye a `WITHDRAW_SESSION_TIMEOUT_SECS` (30 min)
+/// SOLO en `withdraw_sweep_batch` (dirección abort, `caller != investor`); el gate
+/// de `withdraw_abort` sigue en 30 min (subsumido por `fully_swept()`).
+pub const WITHDRAW_ORPHAN_ABORT_SECS: i64 = 48 * 60 * 60;
+
 #[account]
 #[derive(Default)]
 pub struct WithdrawSession {

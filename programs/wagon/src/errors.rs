@@ -416,4 +416,15 @@ pub enum WagonError {
     // Ceremonia #53 — close_stranded / admin_clear_stranded exigen la bandera puesta.
     #[msg("El vault no tiene valor fuera de tabla marcado.")]
     NotStranded = 6184,
+
+    // Ceremonia #54 (DT-D) — A5 modo (c): la prueba del CAMINO 1 no congelado exige
+    // que el propio MINT bloquee la transferencia (NonTransferable / TransferHook
+    // armado / Pausable pausado). Si no bloquea, no hay brick que liberar.
+    #[msg("El mint de la pata no bloquea la transferencia: no hay brick que liberar.")]
+    DepositForceReleaseMintNotBlocking = 6185,
+
+    // Ceremonia #54 (DT-D) — A5 modos (b)/(c): exigen que el escrow de la pata tenga
+    // saldo > 0 (una transferencia realmente pendiente que el brick impide).
+    #[msg("El escrow de la pata no tiene transferencia pendiente: nada que liberar.")]
+    DepositForceReleaseNoPendingTransfer = 6186,
 }

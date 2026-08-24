@@ -42,8 +42,8 @@ use crate::instructions::create_vault::verify_mint_tier_b;
 use crate::state::vault_layout as vlayout;
 use crate::state::{ProtocolConfig, UserPosition, WithdrawSession};
 use crate::token_io::{
-    derive_live_ata, read_mint_decimals, read_token_amount, transfer_checked_signed,
-    verify_token_account, TOKEN_2022_PROGRAM_ID,
+    derive_live_ata, mint_blocks_transfer, read_mint_decimals, read_token_amount, read_token_state,
+    transfer_checked_signed, verify_token_account, TOKEN_2022_PROGRAM_ID, TOKEN_STATE_FROZEN,
 };
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
@@ -233,6 +233,12 @@ pub fn handler<'info>(
 
     // ---- H-3: reservar la parte del inversor del idle USDC → hucha USDC ----
     let vault_usdc_before = read_token_amount(&ctx.accounts.vault_usdc_ata.to_account_info())?;
+    // DT-A(a) (#54): si la ATA USDC del vault está CONGELADA, aparcar el slice del
+    // idle (forfeit: el inversor renuncia a esa porción, se queda en el vault) en vez
+    // de revertir el init entero — espejo del park Tier-B. read_token_state es lectura
+    // PURA, inmune al propio freeze (leer una cuenta congelada nunca revierte).
+    let vault_usdc_frozen =
+        read_token_state(&ctx.accounts.vault_usdc_ata.to_account_info())? == TOKEN_STATE_FROZEN;
     // Ceremonia 2026-08 (WA-01/WI-01/P2-1/P2-2): el slice de USDC ocioso usa el
     // MISMO denominador aumentado que las patas de token (:336-351):
     // `total_shares_before + pending_committed_shares + pending_burned_shares`.
@@ -249,7 +255,9 @@ pub fn handler<'info>(
     // `u64::try_from` del DIVISOR y revertiría con S+Pc+Pb > u64::MAX — camino
     // sagrado, cero reverts): aquí solo el resultado (≤ vault_usdc_before ≤ u64::MAX)
     // va a u64.
-    let usdc_slice_from_vault = {
+    let usdc_slice_from_vault = if vault_usdc_frozen {
+        0u64 // DT-A(a): park del idle — forfeit, se queda en la ATA USDC congelada del vault
+    } else {
         let denom = (total_shares_before as u128)
             .checked_add(pending_committed_shares as u128)
             .ok_or(WagonError::MathOverflow)?
@@ -342,7 +350,21 @@ pub fn handler<'info>(
         // failure here means the mint flipped a dangerous extension since vault
         // creation → PARK.
         let tier_ok = verify_mint_tier_b(mint_ai, &alloc_mint).is_ok();
-        if !tier_ok {
+        // DT-A(a) (#54): aparcar (forfeit, se queda en el vault) en vez de revertir el
+        // init entero — la salida nunca se estrangula para TODO el vault — cuando una
+        // pata no se puede mover. Tres causas, en CORTOCIRCUITO (barato→caro):
+        //  - !tier_ok: el mint volcó una extensión peligrosa desde la creación (#53).
+        //  - vault_ata CONGELADA (freeze authority del emisor: Circle, un memecoin…).
+        //  - el propio MINT bloquea la transferencia sin congelar la cuenta: un mint
+        //    Token-2022 de CONFIANZA (xStocks/Backed) PAUSADO, o con TransferHook
+        //    armado tras la creación, pasa Tier-B (short-circuit trusted) y NO figura
+        //    como Frozen → `mint_blocks_transfer` (mismo lector que A5/DT-D) lo caza.
+        // El escrow es ATA fresca de esta sesión (nunca pre-congelable). cursor+=3 ya
+        // ocurrió antes del gate → el invariante cursor==remaining.len() se conserva.
+        if !tier_ok
+            || read_token_state(vault_ata_ai)? == TOKEN_STATE_FROZEN
+            || mint_blocks_transfer(&mint_ai.try_borrow_data()?)
+        {
             legs_completed |= bit; // parked: forfeit this slice, leave it in the vault
             continue;
         }

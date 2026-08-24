@@ -11,9 +11,10 @@
 //! - **Abort direction** (incomplete, stale, or already `aborting`): the
 //!   unsold escrows are still funded, so the sweep RETURNS the tokens to the
 //!   vault and closes the escrow. Sets `session.aborting`, which permanently
-//!   blocks the swap/settle paths. The investor any time; ANYONE after
-//!   `WITHDRAW_SESSION_TIMEOUT_SECS` (30 min) — the orphan-session guarantee.
-//!   `withdraw_abort` then re-mints the shares (deshacer-total).
+//!   blocks the swap/settle paths. The investor any time; a THIRD PARTY only
+//!   after `WITHDRAW_ORPHAN_ABORT_SECS` (48h, DT-C #54) — nested above the
+//!   in-kind window (24h) so a griefer cannot latch `aborting=1` and kill the
+//!   investor's in-kind claim. `withdraw_abort` then re-mints the shares.
 //!
 //! Either way each swept escrow is emptied and closed, rent → investor. The
 //! direction is decided ON-CHAIN from session + vault state — the caller only
@@ -35,7 +36,7 @@ use crate::constants::*;
 use crate::errors::WagonError;
 use crate::events::WithdrawEscrowSwept;
 use crate::state::vault_layout as vlayout;
-use crate::state::withdraw_session::WITHDRAW_SESSION_TIMEOUT_SECS;
+use crate::state::withdraw_session::WITHDRAW_ORPHAN_ABORT_SECS;
 use crate::state::WithdrawSession;
 use crate::token_io::{
     close_token_account_signed, derive_live_ata, read_mint_decimals, read_token_amount,
@@ -49,8 +50,9 @@ pub struct WithdrawSweepBatchArgs {
 
 #[derive(Accounts)]
 pub struct WithdrawSweepBatch<'info> {
-    /// Settle direction: anyone. Abort direction: the investor, or anyone after
-    /// the 30-minute timeout. Pays the tx fee; never receives funds.
+    /// Settle direction: anyone. Abort direction: the investor any time, or a
+    /// third party only after `WITHDRAW_ORPHAN_ABORT_SECS` (48h, DT-C #54).
+    /// Pays the tx fee; never receives funds.
     #[account(mut)]
     pub caller: Signer<'info>,
 
@@ -127,7 +129,16 @@ pub fn handler<'info>(
     // ---- Decide the direction ON-CHAIN -------------------------------------
     let abort_direction = session.aborting == 1 || !session.is_complete();
     if abort_direction {
-        let timed_out = now.saturating_sub(session.created_at) > WITHDRAW_SESSION_TIMEOUT_SECS;
+        // DT-C (#54): relojes ANIDADOS. Un TERCERO solo puede latchear el abort de
+        // una sesión huérfana ESTRICTAMENTE por encima de la ventana en especie
+        // (WITHDRAW_ORPHAN_ABORT_SECS = 48h > WITHDRAW_INKIND_TIMEOUT_SECS = 24h).
+        // Entre 24h y 48h SOLO el inversor actúa; si un tercero pudiera abortar
+        // antes, aborting=1 vetaría su cobro en especie (withdraw_claim_leg_in_kind)
+        // = griefing del backstop de liveness. El inversor: cualquier hora.
+        // ACOPLAMIENTO: withdraw_abort mantiene 30min a propósito — queda subsumido
+        // por su gate `fully_swept()` (un tercero no re-acuña sin barrer antes, y
+        // barrer ahora exige 48h).
+        let timed_out = now.saturating_sub(session.created_at) > WITHDRAW_ORPHAN_ABORT_SECS;
         require!(
             ctx.accounts.caller.key() == session.investor || timed_out,
             WagonError::WithdrawAbortTooEarly

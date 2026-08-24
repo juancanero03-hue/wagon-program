@@ -26,7 +26,7 @@ use crate::errors::WagonError;
 use crate::events::WithdrawCompleted;
 use crate::state::vault_layout as vlayout;
 use crate::state::{ProtocolConfig, UserPosition, WithdrawSession};
-use crate::token_io::{derive_live_ata, verify_token_account};
+use crate::token_io::{derive_live_ata, is_payable_usdc_ata, verify_token_account};
 
 #[derive(Accounts)]
 pub struct WithdrawSettle<'info> {
@@ -222,16 +222,13 @@ pub fn handler(ctx: Context<WithdrawSettle>) -> Result<()> {
         derive_live_ata(&creator_rewards_authority, &usdc_mint_pk, &spl_token::ID),
         WagonError::CreatorRewardsAtaMismatch
     );
-    verify_token_account(
-        &ctx.accounts.creator_rewards_ata.to_account_info(),
-        &usdc_mint_pk,
-        &creator_rewards_authority,
-    )?;
-    require_keys_eq!(
-        *ctx.accounts.protocol_treasury_usdc_ata.owner,
-        spl_token::ID,
-        WagonError::InvalidJupiterRoute
-    );
+    // DT-B (#54): la verificación INCONDICIONAL de la hucha del creador y el
+    // owner-check INCONDICIONAL de la tesorería se ELIMINAN de aquí — hacían
+    // revertir el settle si la hucha no existía (depósitos <10 USDC, exentos de
+    // fee) o si esas cuentas se congelaban, aunque no hubiera comisión que pagar.
+    // Los pins por pubkey (arriba) se conservan; cada transfer de comisión (abajo)
+    // se gatea por `is_payable_usdc_ata` y el importe no pagado cae al vault por el
+    // barrido de residuo. Fail-open simétrico con A5: nunca estrangular la salida.
 
     // ---- H-3: validar la hucha USDC de la sesión ---------------------------
     let session_key = ctx.accounts.withdraw_session.key();
@@ -314,7 +311,17 @@ pub fn handler(ctx: Context<WithdrawSettle>) -> Result<()> {
             usdc_to_investor,
         )?;
     }
-    if protocol_fee > 0 {
+    // DT-B (#54): gatear el cut del protocolo por payability. Tesorería con
+    // expected_owner=None (destino ya key-pinned arriba; su authority no se
+    // almacena). Si no es payable (inexistente/congelada) se SALTA, y el importe
+    // se queda en el escrow y cae al vault por el barrido de residuo de abajo.
+    if protocol_fee > 0
+        && is_payable_usdc_ata(
+            &ctx.accounts.protocol_treasury_usdc_ata.to_account_info(),
+            &usdc_mint_pk,
+            None,
+        )
+    {
         token::transfer(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
@@ -328,7 +335,17 @@ pub fn handler(ctx: Context<WithdrawSettle>) -> Result<()> {
             protocol_fee,
         )?;
     }
-    if creator_fee > 0 {
+    // DT-B (#54): gatear el cut del creador por payability. Hucha con
+    // expected_owner=Some(creator_rewards_authority) (owner = PDA [creator-rewards,
+    // creator], igual que el verify que se eliminó). Si la hucha no existe o está
+    // congelada se SALTA y el cut cae al vault por el barrido de residuo.
+    if creator_fee > 0
+        && is_payable_usdc_ata(
+            &ctx.accounts.creator_rewards_ata.to_account_info(),
+            &usdc_mint_pk,
+            Some(creator_rewards_authority),
+        )
+    {
         token::transfer(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
@@ -348,7 +365,18 @@ pub fn handler(ctx: Context<WithdrawSettle>) -> Result<()> {
     // vault; el rent de la cuenta vuelve al inversor. Espejo de deposit_settle.
     let residual_usdc =
         crate::token_io::read_token_amount(&ctx.accounts.session_usdc_escrow.to_account_info())?;
-    if residual_usdc > 0 {
+    // DT-B (#54, companion): tolerar un vault_usdc_ata CONGELADO. Si no es payable y
+    // hay residuo, se SALTAN sweep Y close — el escrow queda huérfano con el residuo
+    // (recuperable a futuro), pero el inversor YA cobró (arriba) y la sesión (PDA
+    // WithdrawSession) cierra igual por su `close = investor` de Anchor. Así el settle
+    // nunca revierte por un freeze de la ATA USDC del vault (fail-open A5). El destino
+    // ya está key-pinned a usdc_ata_pk → expected_owner=None.
+    let vault_ata_payable = is_payable_usdc_ata(
+        &ctx.accounts.vault_usdc_ata.to_account_info(),
+        &usdc_mint_pk,
+        None,
+    );
+    if residual_usdc > 0 && vault_ata_payable {
         token::transfer(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
@@ -362,15 +390,17 @@ pub fn handler(ctx: Context<WithdrawSettle>) -> Result<()> {
             residual_usdc,
         )?;
     }
-    token::close_account(CpiContext::new_with_signer(
-        ctx.accounts.token_program.to_account_info(),
-        CloseAccount {
-            account: ctx.accounts.session_usdc_escrow.to_account_info(),
-            destination: ctx.accounts.investor.to_account_info(),
-            authority: ctx.accounts.withdraw_session.to_account_info(),
-        },
-        signer_seeds,
-    ))?;
+    if residual_usdc == 0 || vault_ata_payable {
+        token::close_account(CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            CloseAccount {
+                account: ctx.accounts.session_usdc_escrow.to_account_info(),
+                destination: ctx.accounts.investor.to_account_info(),
+                authority: ctx.accounts.withdraw_session.to_account_info(),
+            },
+            signer_seeds,
+        ))?;
+    }
 
     // ---- Update state -----------------------------------------------------
     let position = &mut ctx.accounts.user_position;

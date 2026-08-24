@@ -80,6 +80,93 @@ pub fn read_token_state(acc: &AccountInfo) -> Result<u8> {
     Ok(data[TOKEN_STATE_OFFSET])
 }
 
+/// Fail-open (ceremonia #54, DT-B): `true` SOLO si `acc` es una token account
+/// VIVA y NO CONGELADA de `expected_mint` (y, si `Some`, propiedad de
+/// `expected_owner`). PURA: nunca revierte — una cuenta inexistente, malformada
+/// o congelada devuelve `false` y el caller SALTA el transfer de la comisión en
+/// vez de tumbar todo el `withdraw_settle`. Espejo booleano de la lectura pura
+/// de A5 (`read_token_state`). El destino ya viene key-pinned por el caller; para
+/// la tesorería `expected_owner` es `None` porque el programa no almacena su
+/// authority, solo la ATA.
+pub fn is_payable_usdc_ata(
+    acc: &AccountInfo,
+    expected_mint: &Pubkey,
+    expected_owner: Option<Pubkey>,
+) -> bool {
+    let prog_owner = acc.owner;
+    if *prog_owner != spl_token::ID && *prog_owner != TOKEN_2022_PROGRAM_ID {
+        return false;
+    }
+    let data = match acc.try_borrow_data() {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    if data.len() < 165 {
+        return false;
+    }
+    if &data[0..32] != expected_mint.as_ref() {
+        return false;
+    }
+    if let Some(owner) = expected_owner {
+        if &data[32..64] != owner.as_ref() {
+            return false;
+        }
+    }
+    data[TOKEN_STATE_OFFSET] != TOKEN_STATE_FROZEN
+}
+
+/// Lector PURO (ceremonia #54, DT-D): ¿el propio MINT bloquea toda
+/// transferencia? Sin CPI, inmune a freeze. Devuelve `true` SOLO si camina el
+/// TLV de extensiones Token-2022 y encuentra: ext 9 `NonTransferable`, O ext 14
+/// `TransferHook` ARMADO (`program_id` != 0), O ext 25 `Pausable` con el byte
+/// `paused` (offset 32 del `ext_data`) == 1 LEÍDO EN VIVO. A diferencia de
+/// `create_vault::verify_token2022_extensions`, NO hace short-circuit para mints
+/// TRUSTED: `Pausable` solo existe en mints trusted, así que cortar por confianza
+/// dejaría su caso primario sin cubrir. Un mint classic (o 2022 sin TLV) da
+/// `false`. Espeja el layout base (82 B + padding + discriminador @165 == 1 +
+/// TLV {u16 tipo, u16 len, valor} desde el offset 166) de `create_vault`.
+pub fn mint_blocks_transfer(mint_data: &[u8]) -> bool {
+    if mint_data.len() < 166 || mint_data[165] != 1 {
+        return false;
+    }
+    let mut cursor: usize = 166;
+    while cursor + 4 <= mint_data.len() {
+        let ext_type = u16::from_le_bytes([mint_data[cursor], mint_data[cursor + 1]]);
+        let ext_len = u16::from_le_bytes([mint_data[cursor + 2], mint_data[cursor + 3]]) as usize;
+        let val_start = match cursor.checked_add(4) {
+            Some(v) => v,
+            None => return false,
+        };
+        let ext_end = match val_start.checked_add(ext_len) {
+            Some(v) => v,
+            None => return false,
+        };
+        if ext_end > mint_data.len() {
+            return false;
+        }
+        let ext_data = &mint_data[val_start..ext_end];
+        match ext_type {
+            0 => break, // Uninitialized: fin de la lista de extensiones.
+            9 => return true, // NonTransferable.
+            14 => {
+                // TransferHook: 32 B authority + 32 B program_id. Armado <=> program_id != 0.
+                if ext_data.len() >= 64 && ext_data[32..64].iter().any(|&b| b != 0) {
+                    return true;
+                }
+            }
+            25 => {
+                // Pausable: 32 B authority + 1 B paused (PodBool). Bloquea <=> paused != 0 (en vivo).
+                if ext_data.len() >= 33 && ext_data[32] != 0 {
+                    return true;
+                }
+            }
+            _ => {} // TransferFeeConfig(1)/DefaultAccountState(6)/PermanentDelegate(12)/metadata… no bloquean aquí.
+        }
+        cursor = ext_end;
+    }
+    false
+}
+
 /// Lee `decimals` de un mint account (classic o 2022).
 pub fn read_mint_decimals(mint_ai: &AccountInfo) -> Result<u8> {
     let data = mint_ai.try_borrow_data()?;

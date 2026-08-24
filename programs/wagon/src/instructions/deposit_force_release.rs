@@ -40,7 +40,8 @@ use crate::guards::VaultGuard;
 use crate::state::vault_layout as vlayout;
 use crate::state::{DepositSession, ProtocolConfig};
 use crate::token_io::{
-    derive_live_ata, read_token_amount, read_token_state, verify_token_account, TOKEN_STATE_FROZEN,
+    derive_live_ata, mint_blocks_transfer, read_token_amount, read_token_state, verify_token_account,
+    TOKEN_STATE_FROZEN,
 };
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
@@ -134,12 +135,13 @@ pub fn handler(ctx: Context<DepositForceRelease>, args: DepositForceReleaseArgs)
     let frozen_ai = ctx.accounts.frozen_account.to_account_info();
     let frozen_key = ctx.accounts.frozen_account.key();
 
-    require!(
-        read_token_state(&frozen_ai)? == TOKEN_STATE_FROZEN,
-        WagonError::DepositForceReleaseNotFrozen
-    );
-
     if session.fully_swept() {
+        // DT-D (#54): CAMINO 2 conserva su prueba de freeze (movida aquí desde el
+        // gate común, que ahora se ramifica por camino en el CAMINO 1).
+        require!(
+            read_token_state(&frozen_ai)? == TOKEN_STATE_FROZEN,
+            WagonError::DepositForceReleaseNotFrozen
+        );
         // CAMINO 2: barrida entera; solo el transfer/close del USDC residual del
         // settle puede bloquear. proof_mint == USDC; el escrow debe tener residual
         // > 0; y la cuenta congelada es el `vault_usdc_ata` o el escrow USDC.
@@ -188,10 +190,46 @@ pub fn handler(ctx: Context<DepositForceRelease>, args: DepositForceReleaseArgs)
         let token_prog_id = *ctx.accounts.proof_mint.to_account_info().owner;
         let escrow_ata = derive_live_ata(&session_key, &leg_mint, &token_prog_id);
         let vault_dest = derive_live_ata(&vault_key, &leg_mint, &token_prog_id);
-        require!(
-            frozen_key == escrow_ata || frozen_key == vault_dest,
-            WagonError::DepositForceReleaseNotFrozen
-        );
+
+        // DT-D (#54): tres submodos de prueba. (a)/(b) por FREEZE de cuenta (como
+        // antes, ahora con L-02 en (b)); (c) NUEVO por bloqueador de MINT.
+        let frozen_state = read_token_state(&frozen_ai)?;
+        if frozen_state == TOKEN_STATE_FROZEN {
+            if frozen_key == escrow_ata {
+                // (a) escrow de la pata congelado: el barrido escrow->vault revierte.
+                // Sin chequeo de saldo (el close de un escrow congelado revierte aun a 0).
+            } else {
+                // (b) destino-vault congelado (L-02): exige ADEMÁS que el escrow segregado
+                // de la pata tenga saldo > 0 (una transferencia realmente pendiente). El
+                // escrow de la pata se pasa en el slot `session_usdc_escrow` (hoy ignorado
+                // en CAMINO 1), validado canónico contra `escrow_ata`.
+                require_keys_eq!(frozen_key, vault_dest, WagonError::DepositForceReleaseNotFrozen);
+                let leg_escrow_ai = ctx.accounts.session_usdc_escrow.to_account_info();
+                require_keys_eq!(leg_escrow_ai.key(), escrow_ata, WagonError::EscrowAtaMismatch);
+                verify_token_account(&leg_escrow_ai, &leg_mint, &session_key)?;
+                require!(
+                    read_token_amount(&leg_escrow_ai)? > 0,
+                    WagonError::DepositForceReleaseNoPendingTransfer
+                );
+            }
+        } else {
+            // (c) NUEVO: ninguna cuenta congelada, el brick lo causa el propio MINT
+            // (NonTransferable / TransferHook armado / Pausable pausado). `frozen_account`
+            // se reinterpreta como el escrow canónico de la pata (con saldo pendiente) y
+            // `proof_mint` (== leg_mint, exigido arriba) es el bloqueador.
+            require_keys_eq!(frozen_key, escrow_ata, WagonError::DepositForceReleaseNotFrozen);
+            verify_token_account(&frozen_ai, &leg_mint, &session_key)?;
+            require!(
+                read_token_amount(&frozen_ai)? > 0,
+                WagonError::DepositForceReleaseNoPendingTransfer
+            );
+            let proof_mint_ai = ctx.accounts.proof_mint.to_account_info();
+            let mint_data = proof_mint_ai.try_borrow_data()?;
+            require!(
+                mint_blocks_transfer(&mint_data),
+                WagonError::DepositForceReleaseMintNotBlocking
+            );
+        }
     }
 
     // ---- Efecto: liberar los contadores (fail-open) + latch aborting --------
