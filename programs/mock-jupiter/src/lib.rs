@@ -18,14 +18,37 @@
 //!   - Create each destination mint with `mock_authority` as its mint authority.
 //!   - Pre-create (ATA) a mock_authority-owned "collection" account for each
 //!     source mint (USDC in practice).
+//!
+//! # Token-2022 (ceremonia #55)
+//!
+//! La suite 31 ejercita cestas con mints Token-2022 (extensiones reales:
+//! ScaledUiAmount/Pausable, el caso del incidente Athena). El shape de las 7
+//! cuentas NO cambia (los suites clásicos no se tocan; el discriminador `route`
+//! tampoco — gotcha 22: wagon lo valida contra su allowlist). Lo nuevo llega
+//! por `remaining_accounts` OPCIONALES:
+//!   - la cuenta cuyo key == TOKEN_2022_PROGRAM_ID es el programa Token-2022
+//!     (obligatoria si CUALQUIER lado del swap vive en Token-2022);
+//!   - la primera cuenta restante que NO sea ese programa se toma como el
+//!     MINT del source (obligatoria solo si el SOURCE es Token-2022: su
+//!     TransferChecked exige el mint).
+//! Cada lado del swap se enruta al programa de token DUEÑO de su cuenta:
+//! transfer clásico o TransferChecked 2022 para el source; MintTo clásico o
+//! 2022 para el dest. Sin remaining_accounts el comportamiento es idéntico
+//! byte a byte al de siempre.
 
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Mint, MintTo, Token, TokenAccount, Transfer};
+use anchor_lang::solana_program::instruction::{AccountMeta, Instruction};
+use anchor_lang::solana_program::program::{invoke, invoke_signed};
+use anchor_spl::token::{self, MintTo, Token, Transfer};
 
 declare_id!("5XTrg9h1vGodDJv71xtv8ghvcVk5vWCaCuxGAi8ZmGww");
 
 /// PDA seed for this program's authority.
 pub const MOCK_AUTHORITY_SEED: &[u8] = b"mock-auth";
+
+/// Programa SPL Token-2022 (espejo del const de wagon::token_io).
+pub const TOKEN_2022_PROGRAM_ID: Pubkey =
+    anchor_lang::solana_program::pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
 pub struct RouteArgs {
@@ -47,21 +70,65 @@ pub mod mock_jupiter {
         ctx: Context<'_, '_, '_, 'info, Route<'info>>,
         args: RouteArgs,
     ) -> Result<()> {
+        // Remaining accounts opcionales (ver doc del módulo): programa 2022 +
+        // mint del source. Ausentes => camino clásico idéntico al histórico.
+        let mut t22_program: Option<&AccountInfo<'info>> = None;
+        let mut source_mint: Option<&AccountInfo<'info>> = None;
+        for acc in ctx.remaining_accounts {
+            if *acc.key == TOKEN_2022_PROGRAM_ID {
+                t22_program = Some(acc);
+            } else if source_mint.is_none() {
+                source_mint = Some(acc);
+            }
+        }
+
         // 1. Pull source from caller into collection account. `source_authority`
         //    is a Signer because Wagon passed it via invoke_signed with the
         //    vault PDA's seeds — signer status propagates through CPIs as long
         //    as each AccountMeta keeps is_signer=true.
-        token::transfer(
-            CpiContext::new(
-                ctx.accounts.token_program.to_account_info(),
-                Transfer {
-                    from: ctx.accounts.source_ata.to_account_info(),
-                    to: ctx.accounts.source_collection_ata.to_account_info(),
-                    authority: ctx.accounts.source_authority.to_account_info(),
-                },
-            ),
-            args.amount_in,
-        )?;
+        let source_is_2022 = *ctx.accounts.source_ata.owner == TOKEN_2022_PROGRAM_ID;
+        if source_is_2022 {
+            // TransferChecked (ix 12) por Token-2022: exige el mint del source.
+            let mint_ai = source_mint.ok_or(anchor_lang::error::ErrorCode::AccountNotEnoughKeys)?;
+            let prog_ai = t22_program.ok_or(anchor_lang::error::ErrorCode::AccountNotEnoughKeys)?;
+            let decimals = read_mint_decimals(mint_ai)?;
+            let mut data = Vec::with_capacity(10);
+            data.push(12u8); // TransferChecked
+            data.extend_from_slice(&args.amount_in.to_le_bytes());
+            data.push(decimals);
+            let ix = Instruction {
+                program_id: TOKEN_2022_PROGRAM_ID,
+                accounts: vec![
+                    AccountMeta::new(*ctx.accounts.source_ata.key, false),
+                    AccountMeta::new_readonly(*mint_ai.key, false),
+                    AccountMeta::new(*ctx.accounts.source_collection_ata.key, false),
+                    AccountMeta::new_readonly(*ctx.accounts.source_authority.key, true),
+                ],
+                data,
+            };
+            invoke(
+                &ix,
+                &[
+                    ctx.accounts.source_ata.to_account_info(),
+                    mint_ai.clone(),
+                    ctx.accounts.source_collection_ata.to_account_info(),
+                    ctx.accounts.source_authority.to_account_info(),
+                    prog_ai.clone(),
+                ],
+            )?;
+        } else {
+            token::transfer(
+                CpiContext::new(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.source_ata.to_account_info(),
+                        to: ctx.accounts.source_collection_ata.to_account_info(),
+                        authority: ctx.accounts.source_authority.to_account_info(),
+                    },
+                ),
+                args.amount_in,
+            )?;
+        }
 
         // 2. Mint dest tokens to dest_ata, signed by the mock authority PDA.
         // Skip minting when out_amount == 0. Withdraw sell legs ask for
@@ -73,18 +140,46 @@ pub mod mock_jupiter {
             let bump = ctx.bumps.mock_authority;
             let seeds: &[&[u8]] = &[MOCK_AUTHORITY_SEED, &[bump]];
             let signer_seeds: &[&[&[u8]]] = &[seeds];
-            token::mint_to(
-                CpiContext::new_with_signer(
-                    ctx.accounts.token_program.to_account_info(),
-                    MintTo {
-                        mint: ctx.accounts.dest_mint.to_account_info(),
-                        to: ctx.accounts.dest_ata.to_account_info(),
-                        authority: ctx.accounts.mock_authority.to_account_info(),
-                    },
+            let dest_is_2022 = *ctx.accounts.dest_mint.owner == TOKEN_2022_PROGRAM_ID;
+            if dest_is_2022 {
+                // MintTo (ix 7) por Token-2022, firmado por el PDA del mock.
+                let prog_ai = t22_program.ok_or(anchor_lang::error::ErrorCode::AccountNotEnoughKeys)?;
+                let mut data = Vec::with_capacity(9);
+                data.push(7u8); // MintTo
+                data.extend_from_slice(&args.out_amount.to_le_bytes());
+                let ix = Instruction {
+                    program_id: TOKEN_2022_PROGRAM_ID,
+                    accounts: vec![
+                        AccountMeta::new(*ctx.accounts.dest_mint.key, false),
+                        AccountMeta::new(*ctx.accounts.dest_ata.key, false),
+                        AccountMeta::new_readonly(*ctx.accounts.mock_authority.key, true),
+                    ],
+                    data,
+                };
+                invoke_signed(
+                    &ix,
+                    &[
+                        ctx.accounts.dest_mint.to_account_info(),
+                        ctx.accounts.dest_ata.to_account_info(),
+                        ctx.accounts.mock_authority.to_account_info(),
+                        prog_ai.clone(),
+                    ],
                     signer_seeds,
-                ),
-                args.out_amount,
-            )?;
+                )?;
+            } else {
+                token::mint_to(
+                    CpiContext::new_with_signer(
+                        ctx.accounts.token_program.to_account_info(),
+                        MintTo {
+                            mint: ctx.accounts.dest_mint.to_account_info(),
+                            to: ctx.accounts.dest_ata.to_account_info(),
+                            authority: ctx.accounts.mock_authority.to_account_info(),
+                        },
+                        signer_seeds,
+                    ),
+                    args.out_amount,
+                )?;
+            }
         }
 
         Ok(())
@@ -113,36 +208,51 @@ pub mod mock_jupiter {
     }
 }
 
+/// Lee `decimals` (offset 44, idéntico classic/2022) sin deserializar el mint.
+fn read_mint_decimals(mint_ai: &AccountInfo) -> Result<u8> {
+    let data = mint_ai.try_borrow_data()?;
+    require!(data.len() > 44, anchor_lang::error::ErrorCode::AccountDidNotDeserialize);
+    Ok(data[44])
+}
+
 #[derive(Accounts)]
 pub struct Route<'info> {
     // Position 0: dest_ata. Wagon's jupiter.rs convention places the
     // destination token account first so it can snapshot balance before/after.
+    // #55: Unchecked para aceptar cuentas de AMBOS programas de token (el
+    // typed `Account<TokenAccount>` rechazaba Token-2022); el propio programa
+    // de token valida mint/owner/estado en el CPI.
+    /// CHECK: token account del dest, validada por el programa de token en el CPI.
     #[account(mut)]
-    pub dest_ata: Account<'info, TokenAccount>,
+    pub dest_ata: UncheckedAccount<'info>,
 
     // Position 1: mock authority PDA. Signs the MintTo via invoke_signed.
     /// CHECK: PDA derived with MOCK_AUTHORITY_SEED; never allocated on-chain.
     #[account(seeds = [MOCK_AUTHORITY_SEED], bump)]
     pub mock_authority: UncheckedAccount<'info>,
 
-    // Position 2: source_ata (USDC ATA of the vault).
+    // Position 2: source_ata (USDC ATA of the vault, o escrow T22 en ventas).
+    /// CHECK: token account del source, validada por el programa de token en el CPI.
     #[account(mut)]
-    pub source_ata: Account<'info, TokenAccount>,
+    pub source_ata: UncheckedAccount<'info>,
 
     // Position 3: source collection account (mock_authority-owned ATA of the
     // source mint). Receives the USDC the vault pays.
+    /// CHECK: token account de colección, validada por el programa de token en el CPI.
     #[account(mut)]
-    pub source_collection_ata: Account<'info, TokenAccount>,
+    pub source_collection_ata: UncheckedAccount<'info>,
 
     // Position 4: destination mint. Needs to be writable for MintTo.
+    /// CHECK: mint del dest (classic o 2022), validado por el programa de token en el CPI.
     #[account(mut)]
-    pub dest_mint: Account<'info, Mint>,
+    pub dest_mint: UncheckedAccount<'info>,
 
     // Position 5: source authority. Signer-via-invoke_signed from Wagon.
     /// CHECK: enforced by SPL transfer (must be authority on source_ata).
     pub source_authority: Signer<'info>,
 
-    // Position 6: SPL Token program.
+    // Position 6: SPL Token program (clásico). El programa Token-2022, si hace
+    // falta, llega por remaining_accounts (ver doc del módulo).
     pub token_program: Program<'info, Token>,
 }
 
@@ -154,8 +264,8 @@ pub struct BurnForTest<'info> {
     #[account(seeds = [MOCK_AUTHORITY_SEED], bump)]
     pub mock_authority: UncheckedAccount<'info>,
     #[account(mut)]
-    pub token_ata: Account<'info, TokenAccount>,
+    pub token_ata: Account<'info, anchor_spl::token::TokenAccount>,
     #[account(mut)]
-    pub token_mint: Account<'info, Mint>,
+    pub token_mint: Account<'info, anchor_spl::token::Mint>,
     pub token_program: Program<'info, Token>,
 }

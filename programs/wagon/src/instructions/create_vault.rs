@@ -27,6 +27,11 @@ use anchor_spl::token::{Mint, Token, TokenAccount};
 
 use crate::constants::*;
 use crate::errors::WagonError;
+use crate::token_io::{
+    EXT_CONFIDENTIAL_MINT_BURN, EXT_CONFIDENTIAL_TRANSFER_FEE, EXT_CONFIDENTIAL_TRANSFER_MINT,
+    EXT_DEFAULT_ACCOUNT_STATE, EXT_NON_TRANSFERABLE, EXT_PAUSABLE, EXT_PERMANENT_DELEGATE,
+    EXT_TRANSFER_FEE_CONFIG, EXT_TRANSFER_HOOK,
+};
 use crate::events::{VaultCreated, VaultCreationFeeCharged};
 use crate::state::feed_registry_layout as flayout;
 use crate::state::vault_layout as layout;
@@ -625,7 +630,9 @@ pub fn verify_mint_tier_b(mint_account: &AccountInfo, expected: &Pubkey) -> Resu
 ///
 /// ext_type 0 (Uninitialized) terminates the list.
 ///
-/// Rejected extensions:
+/// Rejected extensions (numeración corregida en la #55 contra el spec upstream
+/// y bytes reales de mainnet — la tabla anterior estaba corrida en uno desde el
+/// 24 y rechazaba «25» creyéndolo Pausable, cuando 25 = ScaledUiAmount):
 ///   1  TransferFeeConfig          — vault loses value on every Jupiter swap.
 ///   4  ConfidentialTransferMint   — encrypted balances break our math.
 ///   6  DefaultAccountState=Frozen — depositor ATAs spawn frozen.
@@ -633,7 +640,8 @@ pub fn verify_mint_tier_b(mint_account: &AccountInfo, expected: &Pubkey) -> Resu
 ///   12 PermanentDelegate          — issuer can drain allocation ATAs.
 ///   14 TransferHook (active)      — CPI to arbitrary program on every move.
 ///   16 ConfidentialTransferFeeConfig — same family as 4.
-///   25 Pausable                   — issuer can freeze all transfers.
+///   24 ConfidentialMintBurn      — same family as 4.
+///   26 Pausable                   — issuer can freeze all transfers.
 ///
 /// Accepted (no risk to vault solvency or liveness):
 ///   3  MintCloseAuthority
@@ -644,7 +652,8 @@ pub fn verify_mint_tier_b(mint_account: &AccountInfo, expected: &Pubkey) -> Resu
 ///   21 TokenGroup
 ///   22 GroupMemberPointer
 ///   23 TokenGroupMember
-///   24 ScaledUiAmount
+///   25 ScaledUiAmount             — display-only (el programa opera en crudo).
+///   27 PausableAccount            — extensión de CUENTA, jamás aparece en un mint.
 fn verify_token2022_extensions(data: &[u8]) -> Result<()> {
     // Trusted-issuer short-circuit (upgrade #25). If the mint_authority is a
     // vetted regulated issuer (Backed for xStocks, etc.), trust their entire
@@ -683,9 +692,11 @@ fn verify_token2022_extensions(data: &[u8]) -> Result<()> {
 
         match ext_type {
             0 => break, // Uninitialized terminator
-            1 => return err!(WagonError::TierB2022TransferFee),
-            4 => return err!(WagonError::TierB2022ConfidentialTransfer),
-            6 => {
+            EXT_TRANSFER_FEE_CONFIG => return err!(WagonError::TierB2022TransferFee),
+            EXT_CONFIDENTIAL_TRANSFER_MINT => {
+                return err!(WagonError::TierB2022ConfidentialTransfer)
+            }
+            EXT_DEFAULT_ACCOUNT_STATE => {
                 // DefaultAccountState: u8 state at offset 0.
                 // 1 = Initialized (depositor ATAs spawn usable) — OK.
                 // 2 = Frozen (depositor ATAs spawn unusable) — REJECT.
@@ -694,9 +705,9 @@ fn verify_token2022_extensions(data: &[u8]) -> Result<()> {
                     return err!(WagonError::TierB2022DefaultFrozen);
                 }
             }
-            9 => return err!(WagonError::TierB2022NonTransferable),
-            12 => return err!(WagonError::TierB2022PermanentDelegate),
-            14 => {
+            EXT_NON_TRANSFERABLE => return err!(WagonError::TierB2022NonTransferable),
+            EXT_PERMANENT_DELEGATE => return err!(WagonError::TierB2022PermanentDelegate),
+            EXT_TRANSFER_HOOK => {
                 // TransferHook: 32 bytes authority + 32 bytes program_id.
                 // Reject if program_id != all zeros (i.e. a hook is wired up).
                 require!(ext_data.len() >= 64, WagonError::TierBExtensionParseError);
@@ -705,11 +716,181 @@ fn verify_token2022_extensions(data: &[u8]) -> Result<()> {
                     return err!(WagonError::TierB2022TransferHook);
                 }
             }
-            16 => return err!(WagonError::TierB2022ConfidentialTransfer),
-            25 => return err!(WagonError::TierB2022Pausable),
-            _ => {} // Other extensions are safe (metadata, group, scaled UI, ...)
+            EXT_CONFIDENTIAL_TRANSFER_FEE => {
+                return err!(WagonError::TierB2022ConfidentialTransfer)
+            }
+            // #55: familia confidencial completa (antes el 24 caía al catch-all
+            // porque la tabla lo creía ScaledUiAmount).
+            EXT_CONFIDENTIAL_MINT_BURN => {
+                return err!(WagonError::TierB2022ConfidentialTransfer)
+            }
+            // #55: el arm decía 25 (= ScaledUiAmount, inocuo) — el Pausable real
+            // es el 26 y hasta hoy se ACEPTABA en silencio para mints no trusted.
+            EXT_PAUSABLE => return err!(WagonError::TierB2022Pausable),
+            // Other extensions are safe (metadata, group, ScaledUiAmount(25),
+            // PausableAccount(27) — extensión de cuenta, nunca de mint, ...)
+            _ => {}
         }
         cursor = ext_end;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests unitarios (#55): Tier-B contra los bytes REALES del mint SPYx (fixture
+// compartida en `token_io::test_fixtures`). Las variantes se fabrican por
+// cirugía localizada del TLV; los mints con authority NO trusted ejercitan el
+// walker completo (los trusted cortan antes por short-circuit).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tier_b_tests {
+    use super::verify_token2022_extensions;
+    use crate::token_io::test_fixtures::{find_ext, set_ext_type, spyx_bytes};
+    use crate::token_io::{
+        EXT_CONFIDENTIAL_MINT_BURN, EXT_CONFIDENTIAL_TRANSFER_MINT, EXT_DEFAULT_ACCOUNT_STATE,
+        EXT_METADATA_POINTER, EXT_NON_TRANSFERABLE, EXT_PAUSABLE, EXT_PERMANENT_DELEGATE,
+        EXT_SCALED_UI_AMOUNT, EXT_TRANSFER_FEE_CONFIG,
+    };
+
+    /// Tipo aceptado e inerte para NEUTRALIZAR una extensión en una variante
+    /// (3 = MintCloseAuthority; el walker no mira su payload).
+    const EXT_INERTE: u16 = 3;
+
+    fn assert_err_contiene(res: anchor_lang::Result<()>, nombre: &str) {
+        let dbg = format!("{:?}", res);
+        assert!(
+            dbg.contains(nombre),
+            "esperaba error {nombre}, resultado: {dbg}"
+        );
+    }
+
+    /// SPYx real con la mint_authority sustituida (deja de ser Backed) para
+    /// saltar el short-circuit trusted y ejercitar el walker de extensiones.
+    fn spyx_no_trusted() -> Vec<u8> {
+        let mut d = spyx_bytes();
+        for b in &mut d[4..36] {
+            *b = 7;
+        }
+        d
+    }
+
+    fn neutraliza(d: &mut [u8], ext_type: u16) {
+        let (p, _) = find_ext(d, ext_type).expect("extension ausente en la fixture");
+        set_ext_type(d, p, EXT_INERTE);
+    }
+
+    /// El short-circuit trusted (Backed) sigue intacto: el SPYx REAL pasa
+    /// entero, con PermanentDelegate y todo.
+    #[test]
+    fn trusted_short_circuit_intacto() {
+        assert!(verify_token2022_extensions(&spyx_bytes()).is_ok());
+    }
+
+    /// Un mint NO trusted con PermanentDelegate se rechaza (primera extensión
+    /// peligrosa del SPYx en orden de TLV).
+    #[test]
+    fn no_trusted_permanent_delegate_rechazado() {
+        assert_err_contiene(
+            verify_token2022_extensions(&spyx_no_trusted()),
+            "TierB2022PermanentDelegate",
+        );
+    }
+
+    /// #55: ScaledUiAmount (25) se ACEPTA para no-trusted — la intención
+    /// original del doc-comment, rota por la tabla corrida (el arm viejo «25»
+    /// lo rechazaba creyéndolo Pausable).
+    #[test]
+    fn no_trusted_scaled_ui_aceptado() {
+        let mut d = spyx_no_trusted();
+        neutraliza(&mut d, EXT_PERMANENT_DELEGATE);
+        neutraliza(&mut d, EXT_CONFIDENTIAL_TRANSFER_MINT);
+        neutraliza(&mut d, EXT_PAUSABLE);
+        assert!(
+            verify_token2022_extensions(&d).is_ok(),
+            "ScaledUiAmount + resto de extensiones inocuas debe pasar"
+        );
+    }
+
+    /// #55: el Pausable REAL (26) se RECHAZA para no-trusted — hasta hoy caía
+    /// al catch-all y se aceptaba en silencio. La ext 25 se neutraliza ADREDE
+    /// (revision adversarial #55): con la tabla vieja el arm «25» levantaba el
+    /// MISMO error al llegar al ScaledUiAmount y el test pasaba por la razon
+    /// equivocada (gotcha 43); asi, el unico camino al error es el arm 26.
+    #[test]
+    fn no_trusted_pausable_real_rechazado() {
+        let mut d = spyx_no_trusted();
+        neutraliza(&mut d, EXT_PERMANENT_DELEGATE);
+        neutraliza(&mut d, EXT_CONFIDENTIAL_TRANSFER_MINT);
+        neutraliza(&mut d, EXT_SCALED_UI_AMOUNT);
+        assert_err_contiene(verify_token2022_extensions(&d), "TierB2022Pausable");
+    }
+
+    /// DefaultAccountState = Frozen (arm 6, el otro arm condicional y de dinero:
+    /// las ATAs del depositante nacerian congeladas). El SPYx real trae 01
+    /// (Initialized); la variante lo pone a 02.
+    #[test]
+    fn no_trusted_default_frozen_rechazado() {
+        let mut d = spyx_no_trusted();
+        neutraliza(&mut d, EXT_PERMANENT_DELEGATE);
+        let (p, l) = find_ext(&d, EXT_DEFAULT_ACCOUNT_STATE).unwrap();
+        assert_eq!(l, 1);
+        d[p] = 2; // Frozen
+        assert_err_contiene(verify_token2022_extensions(&d), "TierB2022DefaultFrozen");
+    }
+
+    /// TransferFeeConfig (1): el vault sangraria valor en cada swap.
+    #[test]
+    fn no_trusted_transfer_fee_rechazado() {
+        let mut d = spyx_no_trusted();
+        let (p, _) = find_ext(&d, EXT_METADATA_POINTER).unwrap();
+        set_ext_type(&mut d, p, EXT_TRANSFER_FEE_CONFIG);
+        assert_err_contiene(verify_token2022_extensions(&d), "TierB2022TransferFee");
+    }
+
+    /// NonTransferable (9): el vault jamas podria liquidar.
+    #[test]
+    fn no_trusted_non_transferable_rechazado() {
+        let mut d = spyx_no_trusted();
+        let (p, _) = find_ext(&d, EXT_METADATA_POINTER).unwrap();
+        set_ext_type(&mut d, p, EXT_NON_TRANSFERABLE);
+        assert_err_contiene(verify_token2022_extensions(&d), "TierB2022NonTransferable");
+    }
+
+    /// TransferHook ARMADO (14): el SPYx real lo trae DESARMADO (program_id a
+    /// ceros y por eso el mint real pasa); la variante lo arma.
+    #[test]
+    fn no_trusted_hook_armado_rechazado() {
+        let mut d = spyx_no_trusted();
+        neutraliza(&mut d, EXT_PERMANENT_DELEGATE);
+        neutraliza(&mut d, EXT_CONFIDENTIAL_TRANSFER_MINT);
+        neutraliza(&mut d, EXT_SCALED_UI_AMOUNT);
+        neutraliza(&mut d, EXT_PAUSABLE);
+        let (p, l) = find_ext(&d, crate::token_io::EXT_TRANSFER_HOOK).unwrap();
+        assert_eq!(l, 64);
+        d[p + 40] = 0xAB; // program_id != 0
+        assert_err_contiene(verify_token2022_extensions(&d), "TierB2022TransferHook");
+    }
+
+    /// Discriminador de cuenta que no es Mint (data[165] != 1) => malformado.
+    #[test]
+    fn no_trusted_discriminador_no_mint_rechazado() {
+        let mut d = spyx_no_trusted();
+        d[165] = 2;
+        assert_err_contiene(verify_token2022_extensions(&d), "TierBMalformedMint");
+    }
+
+    /// #55: ConfidentialMintBurn (24) se RECHAZA (familia confidencial, como 4
+    /// y 16) — antes caía al catch-all porque la tabla lo creía ScaledUiAmount.
+    #[test]
+    fn no_trusted_confidential_mint_burn_rechazado() {
+        let mut d = spyx_no_trusted();
+        neutraliza(&mut d, EXT_PERMANENT_DELEGATE);
+        neutraliza(&mut d, EXT_CONFIDENTIAL_TRANSFER_MINT);
+        let (p, _) = find_ext(&d, EXT_SCALED_UI_AMOUNT).unwrap();
+        set_ext_type(&mut d, p, EXT_CONFIDENTIAL_MINT_BURN);
+        assert_err_contiene(
+            verify_token2022_extensions(&d),
+            "TierB2022ConfidentialTransfer",
+        );
+    }
 }

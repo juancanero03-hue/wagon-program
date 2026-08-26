@@ -74,6 +74,15 @@ address = "So11111111111111111111111111111111111111112"   # Wrapped SOL
 [[test.validator.clone]]
 address = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"  # Metaplex Token Metadata (create_vault CPI)
 
+# Ceremonia #55: el Token-2022 EMBEBIDO en solana-test-validator 1.18.22 es
+# antiguo (su TokenInstruction termina en el 41): no conoce ScaledUiAmount(43)
+# ni Pausable(44) y la suite 31 muere con "Invalid instruction" al crear el
+# mint gemelo del SPYx. Clonamos el binario VIVO de mainnet (el mismo programa
+# que ejecuta los xStocks reales) igual que ya hacemos con Jupiter v6; el clon
+# de genesis SOMBREA al builtin en ambos jobs del CI.
+[[test.validator.clone]]
+address = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"  # SPL Token-2022 (moderno, con exts 25/26)
+
 [[test.validator.clone]]
 address = "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So"   # mSOL (basket fixture, null freeze auth -> passes Tier B)
 
