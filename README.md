@@ -19,7 +19,7 @@ solana-verify verify-from-repo \
   -u https://api.mainnet-beta.solana.com \
   --program-id 2kZqCjGfKgVR8dUkv4PCogFsFgN3EoSSNX41HN1cBfBA \
   --library-name wagon \
-  https://github.com/OWNER/wagon-program
+  https://github.com/juancanero03-hue/wagon-program
 ```
 
 The build is deterministic (Docker-pinned via `solana-verify build`) and its
