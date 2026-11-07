@@ -1,0 +1,63 @@
+name: verify-reproducibility
+
+# Comprueba que ESTE espejo (root = workspace) reproduce el binario de mainnet.
+# Solo lectura de mainnet (get-program-hash). Lanzar: Actions -> Run workflow.
+# El programa se compila en SBPF v3: solana-verify 0.5.2 elige su imagen de Docker (Agave 4.3.0) por
+# `[workspace.metadata.cli] solana` del Cargo.toml y compila con `--arch v3` (sin él, v0: no cuadraría).
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  reproducibility:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust (para instalar solana-verify)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, pin por SHA
+        with:
+          toolchain: stable
+
+      - name: Instalar solana-verify (versión fijada)
+        run: |
+          set -euo pipefail
+          cargo install solana-verify --version 0.5.2 --locked
+          solana-verify --version
+
+      - name: Cargo.lock completo (el build no puede resolver nada nuevo)
+        run: cargo fetch --locked
+
+      - name: Build reproducible (Docker, SBPF v3)
+        run: |
+          set -euo pipefail
+          solana-verify build --library-name wagon --arch v3
+          python3 - target/deploy/wagon.so <<'PY'
+          import struct, sys
+          cab = open(sys.argv[1], "rb").read(64)
+          ok = (len(cab) == 64 and cab[:4] == b"\x7fELF" and cab[4] == 2 and cab[5] == 1
+                and struct.unpack("<H", cab[18:20])[0] == 247 and struct.unpack("<I", cab[48:52])[0] == 3)
+          print("wagon.so: SBPF v3 ok" if ok else "::error::wagon.so no es un ELF de SBF en SBPF v3")
+          sys.exit(0 if ok else 1)
+          PY
+
+      - name: Comparar hashes (build vs mainnet)
+        run: |
+          set -euo pipefail
+          BUILD_HASH=$(solana-verify get-executable-hash target/deploy/wagon.so)
+          ONCHAIN_HASH=$(solana-verify get-program-hash -u https://api.mainnet-beta.solana.com 2kZqCjGfKgVR8dUkv4PCogFsFgN3EoSSNX41HN1cBfBA)
+          echo "BUILD_HASH=$BUILD_HASH"
+          echo "ONCHAIN_HASH=$ONCHAIN_HASH"
+          if [ "$BUILD_HASH" = "$ONCHAIN_HASH" ]; then
+            echo "RESULTADO: MATCH -> el espejo reproduce el binario de mainnet."
+          else
+            echo "RESULTADO: MISMATCH -> el espejo NO reproduce; revisar contenido."
+            exit 1
+          fi

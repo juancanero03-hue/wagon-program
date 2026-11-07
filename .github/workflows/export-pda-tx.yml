@@ -1,0 +1,61 @@
+name: export-pda-tx
+
+# Genera la transaccion (base58) que registra la verificacion on-chain. La firma
+# la autoridad de upgrade (el vault de Squads): se pega en Squads y se aprueba.
+# NO firma ni envia nada aqui: solo CONSTRUYE e imprime la tx. Se lanza a mano.
+# El commit es una ENTRADA: el espejo es una foto de un solo commit y un fichero no
+# puede llevar escrito el sha del commit que lo contiene.
+# `--arch v3` viaja en los argumentos que se guardan on-chain: con ellos compila
+# OtterSec en remoto. Sin él compilaria en v0 y el sello no cuadraria con mainnet.
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_hash:
+        description: "Commit del espejo que se sella (sha de 40 caracteres hex)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # Entradas por env, no interpoladas en run: (CWE-94).
+    # BASE_IMAGE: la imagen EXACTA (por su huella) con la que verify-reproducibility reprodujo mainnet (solana-verify 0.5.2
+    # la elige para Agave 4.3.0). Viaja en los argumentos guardados on-chain: el servidor de OtterSec no tenía imagen para
+    # 4.3.0 el 7-nov-2026 («No compatible Docker image found for Solana version 4.3.0») y sin ella no compila.
+    env:
+      COMMIT_HASH: ${{ inputs.commit_hash }}
+      BASE_IMAGE: solanafoundation/solana-verifiable-build@sha256:12fd4c0a0790f0fc41ef74b0cdb6bccc167ba6137eb1adb749bac649481c86bd
+    steps:
+      - name: El commit es un sha completo
+        run: |
+          [[ "$COMMIT_HASH" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::commit_hash tiene que ser un sha de 40 caracteres hex"; exit 1; }
+
+      - name: Rust (para instalar solana-verify)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, pin por SHA
+        with:
+          toolchain: stable
+
+      - name: Instalar solana-verify (versión fijada)
+        run: |
+          set -euo pipefail
+          cargo install solana-verify --version 0.5.2 --locked
+          solana-verify --version
+
+      - name: Exportar la tx del PDA (base58)
+        run: |
+          set -euo pipefail
+          solana-verify export-pda-tx \
+            https://github.com/juancanero03-hue/wagon-program \
+            --program-id 2kZqCjGfKgVR8dUkv4PCogFsFgN3EoSSNX41HN1cBfBA \
+            --uploader 6YdqoAnM3498uyycJcSA7Pq2SXLrTk8UUB6L5voXnVyN \
+            --library-name wagon \
+            --arch v3 \
+            --base-image "$BASE_IMAGE" \
+            --commit-hash "$COMMIT_HASH" \
+            --encoding base58 \
+            -u https://api.mainnet-beta.solana.com

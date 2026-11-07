@@ -1,0 +1,232 @@
+//! `deposit_force_release` — Ceremonia #50 (A5): salida FAIL-OPEN del contador
+//! de depósitos comprometidos cuando un FREEZE externo atasca el asiento.
+//!
+//! # El problema (A5)
+//!
+//! `committed_deposits` / `pending_committed_shares` (#43/#44) suben en
+//! `deposit_sweep_batch` (primer barrido settle) y SOLO bajan en
+//! `deposit_settle`. Una sesión COMPROMETIDA (legs_swept != 0, aborting == 0)
+//! no puede abortar (`deposit_abort.rs:108-111`), así que el asiento es su
+//! ÚNICA salida — y puede REVERTIR por un freeze de una freeze authority
+//! externa (Circle en USDC; el emisor de un token de la cesta):
+//!   - CAMINO 1: una pata de la cesta congelada → su barrido revierte → nunca
+//!     `fully_swept()` → `deposit_settle` exige `fully_swept()` → no asienta.
+//!   - CAMINO 2 (retirado en DT-E): el escrow USDC o el `vault_usdc_ata` congelados
+//!     hacían revertir el settle. Desde DT-E el settle de una sesión comprometida no
+//!     se bloquea por ninguna cuenta USDC (lo que no puede moverse vuelve al inversor o
+//!     se queda en la hucha, que el inversor recupera), y una barrida entera NO
+//!     comprometida (todas sus patas USDC) se cancela con `deposit_abort`: una sesión
+//!     barrida entera nunca es elegible aquí.
+//! Con el contador clavado, `close_vault`/`restructure_init`/`rebalance` quedan
+//! vetados → el vault no se puede cerrar ni reestructurar, para siempre.
+//!
+//! # La cura (donación, freeze-inmune, CERO CPI)
+//!
+//! Ix PERMISSIONLESS que, tras un TIMEOUT y una PRUEBA DE FREEZE ligada al
+//! bloqueador EXACTO, resta los DOS contadores (espejo exacto del +P del sweep,
+//! con el MISMO `phantom_shares` sobre los mismos campos inmutables) y pone
+//! `session.aborting = 1`. NO acuña, NO lee oráculo, NO hace ningún CPI (no
+//! lleva token_program ni ATAs transferibles → imposible tocar una cuenta
+//! congelada). Las patas ya barridas al vault quedan DONADAS a los holders
+//! (autolesión del depositante, jamás robo); la sesión queda ABIERTA para que
+//! el `deposit_abort`/sweep-abort existente recupere el escrow segregado al
+//! inversor si (cuando) se descongela. Decisiones de diseño (2026-08-07): timeout
+//! 7 días, prueba de freeze OBLIGATORIA, depositante PIERDE, sin
+//! `rescue_session_escrow`, `total_tvl_usdc` se deja sobre-contado (inocuo, cap
+//! retirado).
+
+use anchor_lang::prelude::*;
+
+use crate::constants::{DEPOSIT_SESSION_SEED, LIQUIDATION_TIMEOUT_SECONDS, PROTOCOL_SEED};
+use crate::errors::WagonError;
+use crate::guards::VaultGuard;
+use crate::state::vault_layout as vlayout;
+use crate::state::{DepositSession, ProtocolConfig};
+use crate::token_io::{
+    derive_live_ata, mint_blocks_transfer, read_token_amount, read_token_state, verify_token_account,
+    TOKEN_STATE_FROZEN,
+};
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
+pub struct DepositForceReleaseArgs {
+    /// CAMINO 1 (sesión NO totalmente barrida): índice de la pata bloqueada
+    /// cuyo escrow o ATA destino está congelado. IGNORADO en CAMINO 2.
+    pub leg_index: u8,
+}
+
+#[derive(Accounts)]
+pub struct DepositForceRelease<'info> {
+    /// Paga la fee; jamás recibe nada. Permissionless.
+    #[account(mut)]
+    pub caller: Signer<'info>,
+
+    /// CHECK: pinneado a `session.investor` vía has_one. No recibe nada aquí
+    /// (la ix no hace CPI); es la semilla del PDA de la sesión.
+    pub investor: UncheckedAccount<'info>,
+
+    /// CHECK: PDA + owner verificados con `VaultGuard::load`; se le escriben los
+    /// dos contadores byte-level.
+    #[account(mut)]
+    pub vault: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        seeds = [
+            DEPOSIT_SESSION_SEED,
+            vault.key().as_ref(),
+            investor.key().as_ref(),
+        ],
+        bump = deposit_session.bump,
+        has_one = investor @ WagonError::DepositSessionWrongInvestor,
+        has_one = vault @ WagonError::DepositSessionWrongVault,
+    )]
+    pub deposit_session: Box<Account<'info, DepositSession>>,
+
+    #[account(seeds = [PROTOCOL_SEED], bump = protocol.bump)]
+    pub protocol: Box<Account<'info, ProtocolConfig>>,
+
+    /// CHECK: mint del token bloqueado (USDC en CAMINO 2; `leg_mints[leg_index]`
+    /// en CAMINO 1). Solo-lectura; su OWNER selecciona el token program para la
+    /// derivación canónica de la ATA.
+    pub proof_mint: UncheckedAccount<'info>,
+
+    /// CHECK: la ATA CONGELADA que prueba que el asiento está bloqueado.
+    /// Verificada canónica (escrow o destino-vault de la pata) y `Frozen` en el
+    /// handler. Lectura pura, inmune al propio freeze.
+    pub frozen_account: UncheckedAccount<'info>,
+
+    /// CHECK: en el modo (b) del CAMINO 1, el escrow de la PATA (con saldo pendiente),
+    /// validado canónico en el handler. (Su nombre viene del CAMINO 2, retirado en DT-E.)
+    pub session_usdc_escrow: UncheckedAccount<'info>,
+}
+
+pub fn handler(ctx: Context<DepositForceRelease>, args: DepositForceReleaseArgs) -> Result<()> {
+    // ---- Vault guard (owner + PDA; NO retiene el borrow) --------------------
+    let vault_ai = ctx.accounts.vault.to_account_info();
+    let _guard = VaultGuard::load(&vault_ai, &ctx.accounts.vault.key(), WagonError::VaultPaused)?;
+
+    let session = &ctx.accounts.deposit_session;
+
+    // ---- Gate 1: COMPROMETIDA ----------------------------------------------
+    // Espejo EXACTO del veto del aborto (deposit_abort.rs:108-111) y del
+    // predicado del incremento (deposit_sweep_batch.rs:277, `legs_swept 0→≠0`
+    // en dirección settle): es justo el conjunto que subió el contador y no lo
+    // ha bajado. Fuera de él, la sesión no está comprometida y NO hay contador
+    // que liberar (o el aborto normal ya la resuelve).
+    require!(
+        session.legs_swept != 0 && session.aborting == 0,
+        WagonError::DepositForceReleaseNotEligible
+    );
+
+    // ---- Gate 2: TIMEOUT (cinturón; la prueba de freeze es el discriminador) -
+    let now = Clock::get()?.unix_timestamp;
+    require!(
+        now.saturating_sub(session.created_at) > LIQUIDATION_TIMEOUT_SECONDS,
+        WagonError::DepositForceReleaseNotEligible
+    );
+
+    // ---- Gate 3: PRUEBA DE FREEZE ligada al bloqueador EXACTO ----------------
+    // Make-or-break (revisión adversarial): una comprometida NO congelada la
+    // asienta CUALQUIERA con el sweep+settle permissionless → NO está atascada →
+    // forzar la donación sería griefing. Por eso la prueba se ata al bit/cuenta
+    // exacta que bloquea el asiento, y exige que esté REALMENTE `Frozen`.
+    let session_key = session.key();
+    let vault_key = ctx.accounts.vault.key();
+    let proof_mint = ctx.accounts.proof_mint.key();
+    let frozen_ai = ctx.accounts.frozen_account.to_account_info();
+    let frozen_key = ctx.accounts.frozen_account.key();
+
+    // DT-E: una sesión barrida ENTERA ya no puede quedar bloqueada por ninguna cuenta USDC: si es
+    // comprometida, el settle no se bloquea por la hucha, la ATA USDC del vault ni la del inversor
+    // (lo que no puede moverse vuelve al inversor o se queda en la hucha); si no lo es, se cancela
+    // con `deposit_abort`. Liberarla solo serviría para DONAR al vault un depósito que sí termina.
+    // El CAMINO 2 desaparece.
+    require!(!session.fully_swept(), WagonError::DepositForceReleaseNotEligible);
+    {
+        // CAMINO 1: una pata barrible-no-barrida congelada → el asiento nunca
+        // llega a `fully_swept()`. La prueba se ata al escrow o al destino-vault
+        // canónico de ESA pata exacta.
+        let leg = args.leg_index as usize;
+        require!(
+            leg < session.leg_count as usize,
+            WagonError::LegIndexOutOfRange
+        );
+        let bit = 1u16 << args.leg_index;
+        require!(
+            (session.legs_completed & bit) != 0
+                && (session.trivial_mask & bit) == 0
+                && (session.legs_swept & bit) == 0,
+            WagonError::DepositForceReleaseNotFrozen
+        );
+        let leg_mint = session.leg_mints[leg];
+        require_keys_eq!(proof_mint, leg_mint, WagonError::DepositForceReleaseNotFrozen);
+        let token_prog_id = *ctx.accounts.proof_mint.to_account_info().owner;
+        let escrow_ata = derive_live_ata(&session_key, &leg_mint, &token_prog_id);
+        let vault_dest = derive_live_ata(&vault_key, &leg_mint, &token_prog_id);
+
+        // DT-D (#54): tres submodos de prueba. (a)/(b) por FREEZE de cuenta (como
+        // antes, ahora con L-02 en (b)); (c) NUEVO por bloqueador de MINT.
+        let frozen_state = read_token_state(&frozen_ai)?;
+        if frozen_state == TOKEN_STATE_FROZEN {
+            if frozen_key == escrow_ata {
+                // (a) escrow de la pata congelado: el barrido escrow->vault revierte.
+                // Sin chequeo de saldo (el close de un escrow congelado revierte aun a 0).
+            } else {
+                // (b) destino-vault congelado (L-02): exige ADEMÁS que el escrow segregado
+                // de la pata tenga saldo > 0 (una transferencia realmente pendiente). El
+                // escrow de la pata se pasa en el slot `session_usdc_escrow` (hoy ignorado
+                // en CAMINO 1), validado canónico contra `escrow_ata`.
+                require_keys_eq!(frozen_key, vault_dest, WagonError::DepositForceReleaseNotFrozen);
+                let leg_escrow_ai = ctx.accounts.session_usdc_escrow.to_account_info();
+                require_keys_eq!(leg_escrow_ai.key(), escrow_ata, WagonError::EscrowAtaMismatch);
+                verify_token_account(&leg_escrow_ai, &leg_mint, &session_key)?;
+                require!(
+                    read_token_amount(&leg_escrow_ai)? > 0,
+                    WagonError::DepositForceReleaseNoPendingTransfer
+                );
+            }
+        } else {
+            // (c) NUEVO: ninguna cuenta congelada, el brick lo causa el propio MINT
+            // (NonTransferable / TransferHook armado / Pausable pausado). `frozen_account`
+            // se reinterpreta como el escrow canónico de la pata (con saldo pendiente) y
+            // `proof_mint` (== leg_mint, exigido arriba) es el bloqueador.
+            require_keys_eq!(frozen_key, escrow_ata, WagonError::DepositForceReleaseNotFrozen);
+            verify_token_account(&frozen_ai, &leg_mint, &session_key)?;
+            require!(
+                read_token_amount(&frozen_ai)? > 0,
+                WagonError::DepositForceReleaseNoPendingTransfer
+            );
+            let proof_mint_ai = ctx.accounts.proof_mint.to_account_info();
+            let mint_data = proof_mint_ai.try_borrow_data()?;
+            require!(
+                mint_blocks_transfer(&mint_data),
+                WagonError::DepositForceReleaseMintNotBlocking
+            );
+        }
+    }
+
+    // ---- Efecto: liberar los contadores (fail-open) + latch aborting --------
+    // Resta el MISMO par (committed, pending) que sumó el barrido de commit, con
+    // el MISMO `phantom_shares` sobre los MISMOS campos inmutables de la sesión
+    // → espejo exacto, sin almacenar P. `saturating_sub` (nunca envuelve).
+    let p = vlayout::phantom_shares(
+        session.amount_usdc,
+        session.total_shares_before,
+        session.tvl_before,
+    );
+    {
+        let mut data = vault_ai.try_borrow_mut_data()?;
+        let cur = vlayout::read_committed_deposits(&data)?;
+        vlayout::write_committed_deposits(&mut data, cur.saturating_sub(1))?;
+        let cur_pending = vlayout::read_pending_committed_shares(&data)?;
+        vlayout::write_pending_committed_shares(&mut data, cur_pending.saturating_sub(p))?;
+    }
+
+    // Latch `aborting = 1`: las patas ya barridas quedan DONADAS al vault (NAV de
+    // los holders); la sesión NO se cierra, para que el `deposit_abort`/sweep-abort
+    // existente recupere el escrow segregado al inversor si se descongela.
+    let session = &mut ctx.accounts.deposit_session;
+    session.aborting = 1;
+
+    Ok(())
+}

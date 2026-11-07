@@ -1,0 +1,1021 @@
+//! `create_vault` — anyone can call. Registers a new vault PDA, creates its
+//! share mint and USDC ATA. Allocations validated here.
+//!
+//! # Why byte-level for VaultState
+//!
+//! `VaultState` is 1,516 bytes (`VaultState::LEN`; ceremonia #41 corrigió el
+//! «1,388» que ponía aquí y en `vault_layout.rs`). With `Account<VaultState>` Anchor materialises
+//! it on the BPF stack during `try_accounts` for `init`. Combined with the
+//! create_account CPI for the vault, share_mint init, and vault_usdc_ata init,
+//! the cumulative stack pressure overflows the 4 KB BPF stack frame.
+//! Empirically: frame 3 without Box, frame 5 with Box. Byte-level write keeps
+//! VaultState entirely off the stack.
+//!
+//! See `state::vault_layout` for byte offsets and helpers.
+//!
+//! `share_mint`, `usdc_mint`, `vault_usdc_ata` stay as `Box<Account<...>>` —
+//! they're small (82-165 bytes) and Anchor's init flow for SPL accounts works
+//! fine at that size.
+
+use anchor_lang::prelude::*;
+use anchor_lang::system_program::{create_account, transfer, CreateAccount, Transfer};
+use anchor_spl::associated_token::{
+    get_associated_token_address, get_associated_token_address_with_program_id,
+    AssociatedToken,
+};
+use anchor_spl::token::{Mint, Token, TokenAccount};
+
+use crate::constants::*;
+use crate::errors::WagonError;
+use crate::token_io::{
+    EXT_CONFIDENTIAL_MINT_BURN, EXT_CONFIDENTIAL_TRANSFER_FEE, EXT_CONFIDENTIAL_TRANSFER_MINT,
+    EXT_DEFAULT_ACCOUNT_STATE, EXT_NON_TRANSFERABLE, EXT_PAUSABLE, EXT_PERMANENT_DELEGATE,
+    EXT_TRANSFER_FEE_CONFIG, EXT_TRANSFER_HOOK, TOKEN_2022_ACCOUNT_BASE_LEN, TOKEN_2022_MINT_BASE_LEN,
+    TOKEN_2022_MULTISIG_LEN,
+};
+use crate::creator_fee;
+use crate::service;
+use crate::events::{ServiceCharged, VaultCreated, VaultCreationFeeCharged, VaultCreationFeeChargedUsdc};
+use crate::state::feed_registry_layout as flayout;
+use crate::state::vault_layout as layout;
+use crate::state::{ProtocolConfig, ServiceConfig, VaultState, VaultStatus};
+use crate::metaplex::{self, METADATA_PREFIX, TOKEN_METADATA_PROGRAM_ID};
+use crate::pricing;
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
+pub struct CreateVaultArgs {
+    pub nonce: u64,
+    /// Vault display name. Borsh `String` for wire efficiency; the handler
+    /// pads/truncates to the canonical fixed length before writing to
+    /// vault_layout. Overflow -> WagonError::NameTooLong (6026).
+    pub name: String,
+    /// Free-form vault description. Same wire/pad pattern as `name`.
+    /// Overflow -> WagonError::DescriptionTooLong (6027).
+    pub description: String,
+    /// On-chain logo URL.
+    /// Overflow -> WagonError::ImageUrlTooLong (6028).
+    pub image_url: String,
+    /// Comma-separated tags. Overflow -> WagonError::TagsTooLong (6029).
+    pub tags: String,
+    pub performance_fee_bps: u16,
+    pub max_slippage_bps: u16,
+    pub mints: Vec<Pubkey>,
+    pub weights_bps: Vec<u16>,
+    /// Metaplex metadata: token ticker (1-10 ASCII alphanumerics).
+    pub symbol: String,
+    /// Metaplex metadata: URI to the off-chain JSON.
+    pub metadata_uri: String,
+    /// Ceremonia USDC §3.5: servicio S en átomos de USDC, firmado por el creador (0 sin
+    /// patrocinio; obligatorio > 0 con `payer` distinto del creador; <= tope).
+    pub service_usdc: u64,
+}
+
+#[derive(Accounts)]
+#[instruction(args: CreateVaultArgs)]
+pub struct CreateVault<'info> {
+    #[account(mut)]
+    pub creator: Signer<'info>,
+
+    /// Ceremonia USDC (§3.2): PAGADOR del rent que crea esta instrucción (vault, share mint, ATA USDC
+    /// del vault y la metadata de Metaplex, incluido su 0,01 SOL), separado
+    /// del propietario. Sin patrocinio, el cliente pasa la MISMA wallet que el
+    /// propietario en los dos papeles (una sola firma y la misma lista de claves;
+    /// la instrucción solo lleva un índice de cuenta más, +1 B); con patrocinio,
+    /// el sponsor. NUNCA paga comisiones: esas siguen saliendo del propietario.
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [PROTOCOL_SEED],
+        bump = protocol.bump,
+        constraint = !protocol.paused @ WagonError::ProtocolPaused,
+    )]
+    pub protocol: Box<Account<'info, ProtocolConfig>>,
+
+    /// Vault state account. UncheckedAccount because we manually create the
+    /// account with `system_program::create_account` and write bytes via
+    /// `state::vault_layout` to avoid the BPF stack overflow that
+    /// `Account<VaultState>` (1.4 KB struct) triggers during init.
+    /// CHECK: PDA at [VAULT_SEED, creator, nonce_le]; created and populated
+    /// by the handler.
+    #[account(
+        mut,
+        seeds = [
+            VAULT_SEED,
+            creator.key().as_ref(),
+            &args.nonce.to_le_bytes(),
+        ],
+        bump,
+    )]
+    pub vault: UncheckedAccount<'info>,
+
+    /// Share mint for this vault. Authority = vault PDA.
+    #[account(
+        init,
+        payer = payer,
+        seeds = [SHARE_MINT_SEED, vault.key().as_ref()],
+        bump,
+        mint::decimals = 6,
+        mint::authority = vault,
+    )]
+    pub share_mint: Box<Account<'info, Mint>>,
+
+    /// USDC mint passthrough.
+    #[account(address = protocol.usdc_mint)]
+    pub usdc_mint: Box<Account<'info, Mint>>,
+
+    /// Vault-owned USDC ATA.
+    #[account(
+        init,
+        payer = payer,
+        associated_token::mint = usdc_mint,
+        associated_token::authority = vault,
+    )]
+    pub vault_usdc_ata: Box<Account<'info, TokenAccount>>,
+
+    /// Metaplex Token Metadata program. Manual CPI; we do not pull
+    /// anchor-spl's metadata feature for binary-size reasons (see
+    /// `metaplex.rs` for the rationale).
+    /// CHECK: address-pinned to the canonical Metaplex program.
+    #[account(address = TOKEN_METADATA_PROGRAM_ID)]
+    pub token_metadata_program: UncheckedAccount<'info>,
+
+    /// Metaplex metadata account for the share mint. PDA owned by the
+    /// Metaplex Token Metadata program. Initialized via manual CPI.
+    /// CHECK: PDA at [b"metadata", token_metadata_program_id, share_mint];
+    /// created and validated by the Token Metadata program during the CPI.
+    #[account(
+        mut,
+        seeds = [
+            METADATA_PREFIX,
+            token_metadata_program.key().as_ref(),
+            share_mint.key().as_ref(),
+        ],
+        bump,
+        seeds::program = token_metadata_program.key(),
+    )]
+    pub metadata: UncheckedAccount<'info>,
+
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+
+    /// Pyth SOL/USD `PriceUpdateV2` used to convert the USD-denominated
+    /// creation fee into lamports (upgrade #35). Only read when
+    /// `protocol.vault_creation_fee_usd_micros > 0`; it must be Pyth's
+    /// OFFICIAL SOL/USD account (#56: `PYTH_PUSH_ORACLE_V2`, shard 0).
+    /// CHECK: ownership, address, feed id, staleness and confidence are
+    /// validated in the handler via `pricing::read_sol_usd_price`.
+    pub sol_usd_price_update: UncheckedAccount<'info>,
+
+    /// Destination of the SOL creation fee (the protocol's SOL treasury).
+    /// CHECK: must equal `protocol.vault_creation_fee_treasury`; enforced in
+    /// the handler iff the fee is ON. Ignored (any writable) when fee = 0.
+    #[account(mut)]
+    pub vault_creation_fee_treasury: UncheckedAccount<'info>,
+
+    /// Ceremonia USDC: ATA USDC canónica del creador, ORIGEN de la comisión cuando
+    /// `protocol.fee_currency_mode == 1` (USDC).
+    /// CHECK: derivación canónica + mint/owner en el handler (sii modo USDC y
+    /// comisión > 0); ignorada (cualquier writable) en modo SOL salvo con S > 0 (§3.5).
+    #[account(mut)]
+    pub creator_usdc_ata: UncheckedAccount<'info>,
+
+    /// Ceremonia USDC: tesorería USDC del protocolo, DESTINO de la comisión.
+    /// CHECK: key == `protocol.treasury_usdc_ata` y PAGABLE en el handler (sii
+    /// modo USDC y comisión > 0); ignorada (cualquier writable) en modo SOL salvo con S > 0 (§3.5).
+    #[account(mut)]
+    pub treasury_usdc_ata: UncheckedAccount<'info>,
+
+    /// Ceremonia USDC §3.5: topes y pausa del servicio S (solo lectura).
+    #[account(seeds = [SERVICE_CONFIG_SEED], bump = service_config.bump)]
+    pub service_config: Box<Account<'info, ServiceConfig>>,
+}
+
+pub fn handler(ctx: Context<CreateVault>, args: CreateVaultArgs) -> Result<()> {
+    // ---- read protocol parameters -------------------------------------------
+    let max_tokens_per_vault = ctx.accounts.protocol.max_tokens_per_vault as usize;
+    let min_perf_fee_bps = ctx.accounts.protocol.min_perf_fee_bps;
+    let max_perf_fee_bps = ctx.accounts.protocol.max_perf_fee_bps;
+
+    // ---- validate shapes ----------------------------------------------------
+    require!(!args.mints.is_empty(), WagonError::EmptyAllocations);
+    require_eq!(
+        args.mints.len(),
+        args.weights_bps.len(),
+        WagonError::AllocationSumMismatch
+    );
+    // F6 (ceremonia #40): manda el MÍNIMO entre el parámetro del protocolo y el
+    // tope efectivo del programa. `protocol.max_tokens_per_vault` vale 10 en la
+    // cuenta viva de mainnet y no hay setter para bajarlo, así que sin
+    // este `min` una llamada directa podía crear un vault de 8-10 patas cuyo
+    // retiro no cabe en una transacción (inversores sin salida). Ver
+    // MAX_TOKENS_PER_VAULT_EFFECTIVE.
+    let max_tokens_per_vault =
+        max_tokens_per_vault.min(crate::constants::MAX_TOKENS_PER_VAULT_EFFECTIVE);
+    require!(
+        args.mints.len() <= max_tokens_per_vault,
+        WagonError::TooManyTokens
+    );
+
+    let sum: u32 = args.weights_bps.iter().map(|w| *w as u32).sum();
+    require_eq!(sum, ALLOCATION_TOTAL_BPS as u32, WagonError::AllocationSumMismatch);
+
+    // Ceremonia #47 (H3): AQUÍ NO se prohíbe el peso 0 A PROPÓSITO. El programa usa el
+    // peso 0 como slot trivial/no financiado (suites 09/17 lo construyen). El PROTOCOLO
+    // nunca financia una pata a peso 0 (deposit_swap_batch exige weight>0 y deposit_init
+    // la pre-marca trivial). Los TRES caminos donde una pata podría quedar FINANCIADA por
+    // el protocolo a peso 0 están vetados: `rebalance` a 0 (pesos sin venta, #47) y
+    // `restructure_init` con un mint que persiste en la cesta a peso 0 (#47), y
+    // `rebalance_swap` con destino a peso 0 (ceremonia 2026-08, RSW-01/VL-02) — todos
+    // con err 6179.
+    //
+    // ✅ RESIDUAL H3 create+donación CERRADO en la CEREMONIA #48 (Opción B). Una pata a peso 0
+    // puede recibir saldo por DONACIÓN directa a su ATA; hasta el #47 `compute_tvl_m2m_strict`
+    // lo VALORABA (inflaba el TVL, diluía al que deposita) mientras `withdraw_init:270` y
+    // `deposit_init:373` lo SALTAN como trivial → asimetría. El #48 hace que
+    // `compute_tvl_m2m_strict` SALTE también las patas `weight_bps==0` (simétrico con
+    // retiro/depósito) → la donación deja de contar como TVL: 0 dilución. El saldo donado NO
+    // queda atrapado: `sweep_to_usdc` lo barre en Liquidating (pérdida del donante, sin víctima
+    // entre usuarios reales; `rescue_untracked_token` no aplica porque el mint sigue en
+    // allocations). `create_vault` sigue sin prohibir el peso 0 (slot trivial legítimo, suites 09/17).
+
+    // dedupe
+    for i in 0..args.mints.len() {
+        for j in (i + 1)..args.mints.len() {
+            require_keys_neq!(args.mints[i], args.mints[j], WagonError::DuplicateToken);
+        }
+    }
+
+    // Tier B mint validation (Phase 3 plumbing). Each mint declared in
+    // args.mints is validated programmatically — the AllowedMintRegistry
+    // was retired (2026-07-03) and create_vault no longer takes its account.
+    // Convention:
+    // ctx.remaining_accounts[i] is the AccountInfo of args.mints[i] for
+    // i in 0..args.mints.len(). La pata USDC también pasa Tier B (su cuenta tiene que ser el mint USDC real,
+    // como en `restructure_init`); solo el FeedRegistry la exime, porque USDC no lleva oráculo.
+    {
+        let usdc_mint_pk = ctx.accounts.protocol.usdc_mint;
+        let remaining = ctx.remaining_accounts;
+        // Ceremonia #37 (pieza 1): además de las N cuentas de mint (una por
+        // allocation), se exige UNA cuenta más al final = el FeedRegistry, para
+        // comprobar que cada mint no-USDC tiene oráculo registrado. El registro
+        // es una sola cuenta con TODOS los mints dentro (va 1 vez, no por-mint).
+        // Convención: remaining[0..N] = mints; remaining[N] = FeedRegistry PDA.
+        require!(
+            remaining.len() >= args.mints.len() + 1,
+            WagonError::TierBMintMismatch
+        );
+        for (i, mint) in args.mints.iter().enumerate() {
+            verify_mint_tier_b(&remaining[i], mint)?;
+        }
+
+        // FeedRegistry al final: address + ownership pineados (misma receta que
+        // compute_tvl_m2m_strict), lectura byte-a-byte (ADR 0004, nunca
+        // try_deserialize). Cada mint no-USDC debe estar en el registro; si no,
+        // el vault sería invaluable/basura → se rechaza la creación.
+        let registry_ai = &remaining[args.mints.len()];
+        let (expected_registry, _) =
+            Pubkey::find_program_address(&[FEED_REGISTRY_SEED], &crate::ID);
+        require_keys_eq!(
+            registry_ai.key(),
+            expected_registry,
+            WagonError::VaultMintNotInFeedRegistry
+        );
+        require_keys_eq!(
+            *registry_ai.owner,
+            crate::ID,
+            WagonError::VaultMintNotInFeedRegistry
+        );
+        let registry_data = registry_ai.try_borrow_data()?;
+        for mint in args.mints.iter() {
+            if *mint == usdc_mint_pk {
+                continue;
+            }
+            // Ceremonia #41: hasta el #40, «estar en el registro» y «tener
+            // precio» eran lo mismo, y por eso bastaba con `is_some()`. La #40
+            // resignificó el bit 3 como SIN ORÁCULO UTILIZABLE (la entrada
+            // existe pero su precio NO se puede usar), así que esa equivalencia
+            // se rompió: sin esta comprobación un vault podría NACER con un
+            // token que el programa no sabe preciar.
+            //
+            // Fallar cerrado en la ENTRADA: se comprueba al crear, que es donde
+            // no cuesta nada. Los vaults que YA existen no se ven afectados.
+            //
+            // `restructure_init` aplica la misma comprobación a la cesta nueva
+            // (ceremonia #42), así que el bit 3 tampoco entra por un cambio de cesta.
+            let idx = flayout::find(&registry_data, mint)?
+                .ok_or(WagonError::VaultMintNotInFeedRegistry)?;
+            let flags = flayout::read_entry_flags(&registry_data, idx)?;
+            require!(
+                flags & crate::state::feed_registry::FEED_FLAG_NO_ORACLE == 0,
+                WagonError::VaultMintNotInFeedRegistry
+            );
+        }
+    }
+
+    // ---- validate economics -------------------------------------------------
+    require!(
+        args.performance_fee_bps >= min_perf_fee_bps
+            && args.performance_fee_bps <= max_perf_fee_bps,
+        WagonError::PerformanceFeeOutOfRange
+    );
+    require!(
+        args.max_slippage_bps >= MIN_SLIPPAGE_BPS && args.max_slippage_bps <= MAX_SLIPPAGE_BPS,
+        WagonError::SlippageOutOfRange
+    );
+
+    // ---- validate Metaplex metadata args -----------------------------------
+    require!(
+        !args.symbol.is_empty()
+            && args.symbol.len() <= metaplex::METAPLEX_SYMBOL_MAX,
+        WagonError::SymbolOutOfRange
+    );
+    require!(
+        args.symbol
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric()),
+        WagonError::SymbolInvalidChars
+    );
+    require!(
+        !args.metadata_uri.is_empty()
+            && args.metadata_uri.len() <= metaplex::METAPLEX_URI_MAX,
+        WagonError::MetadataUriOutOfRange
+    );
+
+    // ---- Ceremonia USDC: moneda de la comisión del creador ----------------
+    // Manda SOLO `protocol.fee_currency_mode` (decisión de diseño 2026-09-22): 1 = USDC
+    // desde la ATA canónica del creador a la tesorería USDC del protocolo; 0 = SOL
+    // como hasta ahora (importe en micro-USD al oráculo SOL/USD). Los importes de
+    // la otra moneda se IGNORAN (no se borran): nunca doble cobro (cobro cero solo
+    // si el importe de la moneda activa es 0), y `mode = 0` es un rollback de UNA
+    // propuesta. Un modo desconocido revierte (defensa en profundidad: el setter
+    // solo escribe 0 o 1).
+    let fee_mode = ctx.accounts.protocol.fee_currency_mode;
+    require!(
+        fee_mode == FEE_CURRENCY_MODE_SOL || fee_mode == FEE_CURRENCY_MODE_USDC,
+        WagonError::InvalidFeeCurrencyParams
+    );
+    if fee_mode == FEE_CURRENCY_MODE_USDC {
+        let amount_usdc = ctx.accounts.protocol.vault_creation_fee_usdc;
+        if amount_usdc > 0 {
+            creator_fee::charge_creator_fee_usdc(
+                &ctx.accounts.protocol,
+                amount_usdc,
+                &creator_fee::CreatorFeeAccounts {
+                    creator: &ctx.accounts.creator.to_account_info(),
+                    creator_usdc_ata: &ctx.accounts.creator_usdc_ata.to_account_info(),
+                    treasury_usdc_ata: &ctx.accounts.treasury_usdc_ata.to_account_info(),
+                    token_program: &ctx.accounts.token_program.to_account_info(),
+                },
+            )?;
+            emit!(VaultCreationFeeChargedUsdc {
+                vault: ctx.accounts.vault.key(),
+                creator: ctx.accounts.creator.key(),
+                amount_usdc,
+            });
+        }
+    }
+
+    // ---- Ceremonia USDC §3.5: servicio S (argumento firmado por el creador) ---
+    // Patrocinio = `payer` distinto del creador (mismo criterio que §3.2 / §3.3): exige
+    // S > 0; todo S > 0 exige servicio activo y S <= tope. Cobro desde la cuenta USDC del
+    // creador a la tesorería del protocolo (D5), atómico con la publicación. Con S > 0 las
+    // dos cuentas USDC son obligatorias también en modo SOL.
+    {
+        let sponsored = ctx.accounts.payer.key() != ctx.accounts.creator.key();
+        let cfg = &ctx.accounts.service_config;
+        service::check_service(sponsored, args.service_usdc, cfg.max_for(SERVICE_KIND_CREATE), cfg.paused)?;
+        let charged = service::charge_service_usdc(
+            &ctx.accounts.protocol,
+            args.service_usdc,
+            &service::ServiceAccounts {
+                user: &ctx.accounts.creator.to_account_info(),
+                user_usdc_ata: &ctx.accounts.creator_usdc_ata.to_account_info(),
+                treasury_usdc_ata: &ctx.accounts.treasury_usdc_ata.to_account_info(),
+                token_program: &ctx.accounts.token_program.to_account_info(),
+            },
+        )?;
+        if charged > 0 {
+            emit!(ServiceCharged {
+                user: ctx.accounts.creator.key(),
+                vault: ctx.accounts.vault.key(),
+                kind: SERVICE_KIND_CREATE,
+                amount_usdc: charged,
+                generation: 0,
+                op_account: ctx.accounts.vault.key(),
+            });
+        }
+    }
+
+    // ---- upgrade #35: vault-creation fee (USD-denominated, oracle-priced) ---
+    // Cobro en SOL (solo con fee_currency_mode == 0): fee_usd (ProtocolConfig)
+    // convertido a lamports con el oráculo SOL/USD en el momento de crear. fee = 0
+    // => no se cobra nada y las dos cuentas se ignoran (comportamiento pre-#35).
+    let fee_usd_micros = ctx.accounts.protocol.vault_creation_fee_usd_micros;
+    if fee_mode == FEE_CURRENCY_MODE_SOL && fee_usd_micros > 0 {
+        let expected_treasury = ctx.accounts.protocol.vault_creation_fee_treasury;
+        require_keys_neq!(
+            expected_treasury,
+            Pubkey::default(),
+            WagonError::VaultCreationFeeTreasuryMismatch
+        );
+        require_keys_eq!(
+            ctx.accounts.vault_creation_fee_treasury.key(),
+            expected_treasury,
+            WagonError::VaultCreationFeeTreasuryMismatch
+        );
+        let fee_clock = Clock::get()?;
+        let sol = pricing::read_sol_usd_price(
+            &ctx.accounts.sol_usd_price_update.to_account_info(),
+            &fee_clock,
+        )?;
+        let lamports = pricing::usd_micros_to_lamports(fee_usd_micros, &sol)?
+            .min(VAULT_CREATION_FEE_MAX_LAMPORTS);
+        if lamports > 0 {
+            transfer(
+                CpiContext::new(
+                    ctx.accounts.system_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.creator.to_account_info(),
+                        to: ctx.accounts.vault_creation_fee_treasury.to_account_info(),
+                    },
+                ),
+                lamports,
+            )?;
+            emit!(VaultCreationFeeCharged {
+                vault: ctx.accounts.vault.key(),
+                creator: ctx.accounts.creator.key(),
+                lamports,
+                fee_usd_micros,
+            });
+        }
+    }
+
+    // ---- create the vault PDA manually --------------------------------------
+    let vault_bump = ctx.bumps.vault;
+    let creator_key = ctx.accounts.creator.key();
+    let nonce_le_bytes = args.nonce.to_le_bytes();
+    let creator_ref = creator_key.to_bytes();
+    let signer_seeds: &[&[&[u8]]] = &[&[
+        VAULT_SEED,
+        &creator_ref,
+        &nonce_le_bytes,
+        std::slice::from_ref(&vault_bump),
+    ]];
+    let space = VaultState::LEN as u64;
+    let rent = Rent::get()?.minimum_balance(space as usize);
+
+    create_account(
+        CpiContext::new_with_signer(
+            ctx.accounts.system_program.to_account_info(),
+            CreateAccount {
+                from: ctx.accounts.payer.to_account_info(),
+                to: ctx.accounts.vault.to_account_info(),
+            },
+            signer_seeds,
+        ),
+        rent,
+        space,
+        &crate::ID,
+    )?;
+
+    // ---- populate the vault data byte-level ---------------------------------
+    let vault_key = ctx.accounts.vault.key();
+    let share_mint_key = ctx.accounts.share_mint.key();
+    let usdc_ata_key = ctx.accounts.vault_usdc_ata.key();
+    let clock = Clock::get()?;
+    let allocation_count = args.mints.len() as u8;
+
+    {
+        let mut data = ctx.accounts.vault.try_borrow_mut_data()?;
+        layout::write_discriminator(&mut data)?;
+        layout::write_creator(&mut data, &creator_key)?;
+        layout::write_nonce(&mut data, args.nonce)?;
+        layout::write_share_mint(&mut data, &share_mint_key)?;
+        layout::write_usdc_ata(&mut data, &usdc_ata_key)?;
+        layout::write_status(&mut data, VaultStatus::Active as u8)?;
+        // Upgrade #19: args.name/description/image_url/tags are now Borsh
+        // String on the wire. Validate length against the canonical fixed
+        // VaultState layout sizes and zero-pad before writing. Rejects with
+        // dedicated error codes (6026-6029) so the frontend can surface a
+        // precise message instead of "InstructionDidNotDeserialize".
+        require!(args.name.as_bytes().len() <= VAULT_NAME_LEN, WagonError::NameTooLong);
+        require!(args.description.as_bytes().len() <= VAULT_DESC_LEN, WagonError::DescriptionTooLong);
+        require!(args.image_url.as_bytes().len() <= VAULT_IMAGE_URL_LEN, WagonError::ImageUrlTooLong);
+        require!(args.tags.as_bytes().len() <= VAULT_TAGS_LEN, WagonError::TagsTooLong);
+
+        let mut name_buf = [0u8; VAULT_NAME_LEN];
+        name_buf[..args.name.len()].copy_from_slice(args.name.as_bytes());
+        let mut desc_buf = [0u8; VAULT_DESC_LEN];
+        desc_buf[..args.description.len()].copy_from_slice(args.description.as_bytes());
+        let mut img_buf = [0u8; VAULT_IMAGE_URL_LEN];
+        img_buf[..args.image_url.len()].copy_from_slice(args.image_url.as_bytes());
+        let mut tags_buf = [0u8; VAULT_TAGS_LEN];
+        tags_buf[..args.tags.len()].copy_from_slice(args.tags.as_bytes());
+
+        layout::write_name(&mut data, &name_buf)?;
+        layout::write_description(&mut data, &desc_buf)?;
+        layout::write_image_url(&mut data, &img_buf)?;
+        layout::write_tags(&mut data, &tags_buf)?;
+        layout::write_performance_fee_bps(&mut data, args.performance_fee_bps)?;
+        layout::write_max_slippage_bps(&mut data, args.max_slippage_bps)?;
+        layout::write_allocation_count(&mut data, allocation_count)?;
+
+        // Upgrade #27: per-mint vault_ata must be derived with the mint's
+        // ACTUAL token program (classic SPL Token vs Token-2022). Using the
+        // 2-arg helper (which hard-codes spl_token::id()) for a Token-2022
+        // mint produced a vault_ata that doesn't exist on-chain — the real
+        // ATA was created by the user-side createATAIdempotent ix at the
+        // get_associated_token_address_with_program_id-derived address.
+        // Deposit/withdraw_swap_batch then failed with LegDestAtaMismatch
+        // when comparing the stored (wrong) value against the real ATA.
+        //
+        // remaining_accounts[i] is the mint AccountInfo we already use for
+        // Tier B validation above. Its owner is the SPL Token program id
+        // (classic or 2022) that actually owns this mint.
+        for (i, (mint, weight)) in args.mints.iter().zip(args.weights_bps.iter()).enumerate() {
+            let mint_token_program = ctx.remaining_accounts[i].owner;
+            let vault_ata = get_associated_token_address_with_program_id(
+                &vault_key,
+                mint,
+                mint_token_program,
+            );
+            layout::write_allocation(&mut data, i, mint, *weight, &vault_ata)?;
+        }
+
+        layout::write_last_fee_accrual_ts(&mut data, clock.unix_timestamp)?;
+        layout::write_created_at(&mut data, clock.unix_timestamp)?;
+        layout::write_bump(&mut data, vault_bump)?;
+        layout::write_share_mint_bump(&mut data, ctx.bumps.share_mint)?;
+        // total_shares, aggregate_cost_basis_usdc, tvl_last_computed_usdc,
+        // liquidation_started_at, reserved are all zero from create_account.
+    }
+
+    // ---- increment protocol vault_count -------------------------------------
+    let protocol = &mut ctx.accounts.protocol;
+    protocol.vault_count = protocol
+        .vault_count
+        .checked_add(1)
+        .ok_or(WagonError::MathOverflow)?;
+
+    // ---- create immutable Metaplex metadata for share mint --------------
+    // Mint authority and update authority = vault PDA. We sign via the
+    // same seeds used to create the vault account. is_mutable = false so
+    // nobody (creator included) can ever change name/symbol/uri.
+    {
+        // args.name is already a UTF-8 String after upgrade #19; no decoding
+        // or trim needed because user input never contains trailing NUL.
+        let name_str = args.name.as_str();
+
+        let creator_pk = ctx.accounts.creator.key();
+        let creator_bytes = creator_pk.to_bytes();
+        let nonce_le = args.nonce.to_le_bytes();
+        let vault_bump = ctx.bumps.vault;
+        let vault_signer_seeds: &[&[&[u8]]] = &[&[
+            VAULT_SEED,
+            &creator_bytes,
+            &nonce_le,
+            std::slice::from_ref(&vault_bump),
+        ]];
+
+        let ix = metaplex::build_create_v3_ix(
+            ctx.accounts.metadata.key(),
+            ctx.accounts.share_mint.key(),
+            ctx.accounts.vault.key(),
+            ctx.accounts.payer.key(),
+            ctx.accounts.vault.key(),
+            name_str,
+            &args.symbol,
+            &args.metadata_uri,
+        );
+
+        metaplex::invoke_create_v3(
+            ix,
+            &[
+                ctx.accounts.metadata.to_account_info(),
+                ctx.accounts.share_mint.to_account_info(),
+                ctx.accounts.vault.to_account_info(),
+                ctx.accounts.payer.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+                ctx.accounts.rent.to_account_info(),
+                ctx.accounts.token_metadata_program.to_account_info(),
+            ],
+            vault_signer_seeds,
+        )?;
+    }
+
+    emit!(VaultCreated {
+        vault: vault_key,
+        creator: creator_key,
+        nonce: args.nonce,
+        performance_fee_bps: args.performance_fee_bps,
+        max_slippage_bps: args.max_slippage_bps,
+        allocation_count,
+    });
+
+    Ok(())
+}
+
+/// SPL Token-2022 program ID. Hard-coded so we don't drag in the entire
+/// spl-token-2022 crate just for one Pubkey constant.
+const SPL_TOKEN_2022_ID: Pubkey =
+    anchor_lang::solana_program::pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+
+/// Trusted issuers — Token-2022 mints whose `mint_authority` matches one of
+/// these pubkeys skip the extension scanner entirely (upgrade #25).
+///
+/// Rationale: regulated RWA issuers (Backed Finance for xStocks, Circle for
+/// USDC, etc.) need PermanentDelegate + Pausable + ConfidentialTransfer for
+/// OFAC/MiCA compliance — their compliance teams can confiscate sanctioned
+/// addresses or pause the market on incidents. Rejecting those extensions
+/// would lock the protocol out of regulated assets.
+///
+/// The trade-off: we trust these issuers to NOT use their delegate to drain
+/// vaults arbitrarily — same trust model as accepting USDC's freeze authority
+/// (Circle can freeze any address; we use USDC anyway because we trust Circle).
+///
+/// To add a new issuer: paste its mint_authority pubkey here AND validate
+/// off-chain that (a) it has institutional reputation, (b) its compliance
+/// procedures are public, (c) the issuer publishes on-chain proofs of reserves.
+const TRUSTED_TOKEN2022_MINT_AUTHORITIES: &[Pubkey] = &[
+    anchor_lang::solana_program::pubkey!("7pt9tkctJPK7PPNQJ77GKg8ZffSF6QxoMiCFYHxrtaCj"), // Backed Finance (xStocks)
+];
+
+/// Tier B byte-level mint validation. Replaces the AllowedMintRegistry
+/// enforcement (Phase 3). Validates that the AccountInfo passed in
+/// remaining_accounts[i] really is the mint declared in args.mints[i],
+/// is owned by the SPL Token program OR SPL Token-2022, has the canonical
+/// mint layout, is initialised, has supply > 0, and — for Token-2022 —
+/// carries none of the extensions that would let the issuer rug or freeze
+/// the vault.
+///
+/// Upgrade #23 added Token-2022 support. The 2022 program shares the same
+/// 82-byte base mint layout as classic SPL Token, so the legacy checks
+/// (mint-matches-expected, initialised flag, supply > 0) still apply.
+/// The novel risk is the extension TLV packed after byte 82 — those are
+/// scanned in verify_token2022_extensions below.
+pub fn verify_mint_tier_b(mint_account: &AccountInfo, expected: &Pubkey) -> Result<()> {
+    require_keys_eq!(*mint_account.key, *expected, WagonError::TierBMintMismatch);
+
+    let owner = mint_account.owner;
+    let is_classic = *owner == anchor_spl::token::spl_token::ID;
+    let is_2022 = *owner == SPL_TOKEN_2022_ID;
+    require!(is_classic || is_2022, WagonError::TierBNotSPLToken);
+
+    let data = mint_account.try_borrow_data()?;
+    // Both programs share the same 82-byte base mint at offsets 0..82.
+    // Classic mints are exactly 82 bytes; a 2022 mint is 82 bytes without
+    // extensions or, with them, padded to 165, its account type at byte 165
+    // and the TLV from byte 166 (lengths checked in the scanner below).
+    require!(data.len() >= 82, WagonError::TierBMalformedMint);
+    if is_classic {
+        require!(data.len() == 82, WagonError::TierBMalformedMint);
+    }
+    require!(data[45] == 1, WagonError::TierBMalformedMint);
+    // Upgrade #19: freeze_authority check removed. Regulated stablecoins
+    // (USDC, USDT, EURC, PYUSD) and xStocks/RWAs all have a freeze authority
+    // by compliance design (OFAC sanctions tooling), and rejecting them
+    // bans the entire base-currency layer of the protocol. The quality gate is
+    // the on-chain FeedRegistry (every non-USDC mint needs a registered oracle,
+    // ceremonia #37) plus the Token-2022 extension checks below.
+
+    if is_2022 {
+        verify_token2022_extensions(&data)?;
+    }
+
+    // wSOL exception (Phase 3, upgrade #18): the native SOL wrapper mint
+    // (So11111111111111111111111111111111111111112) is a special-case SPL
+    // mint whose supply is always 0 by design. Users wrap SOL into their
+    // own ATAs but the mint itself never receives a `mint_to`. The other
+    // Tier B checks above (SPL Token owner, 82-byte layout, initialised)
+    // already establish authenticity; the supply
+    // check is for empty-vault rug protection, which does not apply to
+    // wSOL because depositors will swap *real* SOL into it via Jupiter.
+    if *expected == anchor_spl::token::spl_token::native_mint::ID {
+        return Ok(());
+    }
+
+    let supply = u64::from_le_bytes([
+        data[36], data[37], data[38], data[39],
+        data[40], data[41], data[42], data[43],
+    ]);
+    require!(supply > 0, WagonError::TierBEmptyMint);
+    Ok(())
+}
+
+/// Token-2022 TLV extension scanner. Called only when the mint is owned by
+/// the Token-2022 program. Walks the TLV array and rejects any extension
+/// that would let the issuer rug or freeze the vault.
+///
+/// Layout when extensions are present:
+///   - bytes 0-81    : base mint layout (same as classic SPL Token)
+///   - bytes 82-164  : padding (zeros) — Token-2022 pads the mint to 165
+///                     bytes so it never collides with the SPL Token
+///                     Account base length, avoiding Mint/Account
+///                     discriminator ambiguity.
+///   - byte  165     : account_type discriminator (1 = Mint, 2 = Account)
+///   - bytes 166+    : TLV array of {u16 ext_type, u16 ext_len, value}.
+///
+/// ext_type 0 (Uninitialized) terminates the list.
+///
+/// Rejected extensions (numeración corregida en la #55 contra el spec upstream
+/// y bytes reales de mainnet — la tabla anterior estaba corrida en uno desde el
+/// 24 y rechazaba «25» creyéndolo Pausable, cuando 25 = ScaledUiAmount):
+///   1  TransferFeeConfig          — vault loses value on every Jupiter swap.
+///   4  ConfidentialTransferMint   — encrypted balances break our math.
+///   6  DefaultAccountState=Frozen — depositor ATAs spawn frozen.
+///   9  NonTransferable            — vault can never settle.
+///   12 PermanentDelegate          — issuer can drain allocation ATAs.
+///   14 TransferHook (active)      — CPI to arbitrary program on every move.
+///   16 ConfidentialTransferFeeConfig — same family as 4.
+///   24 ConfidentialMintBurn      — same family as 4.
+///   26 Pausable                   — issuer can freeze all transfers.
+///
+/// Accepted (no risk to vault solvency or liveness):
+///   3  MintCloseAuthority
+///   10 InterestBearingConfig
+///   18 MetadataPointer
+///   19 TokenMetadata
+///   20 GroupPointer
+///   21 TokenGroup
+///   22 GroupMemberPointer
+///   23 TokenGroupMember
+///   25 ScaledUiAmount             — la UI escala; el programa MUEVE en crudo y, desde G2-d,
+///                                   VALORA átomos × multiplicador efectivo leído en vivo.
+///   27 PausableAccount            — extensión de CUENTA, jamás aparece en un mint.
+fn verify_token2022_extensions(data: &[u8]) -> Result<()> {
+    // Longitud de un mint de Token-2022 (spl-token-2022 3.0.5, `state.rs` y `extension/mod.rs`): 82 bytes sin
+    // extensiones, o al menos 166 con ellas (base de 82, relleno hasta `Account::LEN` = 165, el tipo de cuenta en
+    // el byte 165 y el TLV desde el 166), y nunca `Multisig::LEN` = 355 (el programa alarga esa medida para no
+    // confundirla con un multisig). Cualquier otra longitud no es un mint (165 justo es una cuenta de tokens sin
+    // extensiones): se rechaza antes que nada, también antes del atajo de los emisores de confianza.
+    require!(
+        data.len() <= TOKEN_2022_MINT_BASE_LEN
+            || (data.len() > TOKEN_2022_ACCOUNT_BASE_LEN && data.len() != TOKEN_2022_MULTISIG_LEN),
+        WagonError::TierBMalformedMint
+    );
+
+    // Trusted-issuer short-circuit (upgrade #25). If the mint_authority is a
+    // vetted regulated issuer (Backed for xStocks, etc.), trust their entire
+    // extension setup wholesale. The SPL mint layout starts with a 4-byte
+    // COption discriminator at offset 0 (1 = Some) and the 32-byte authority
+    // at offset 4..36.
+    if data.len() >= 36 {
+        let auth_disc = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        if auth_disc == 1 {
+            let mut auth_bytes = [0u8; 32];
+            auth_bytes.copy_from_slice(&data[4..36]);
+            let mint_authority = Pubkey::new_from_array(auth_bytes);
+            if TRUSTED_TOKEN2022_MINT_AUTHORITIES.contains(&mint_authority) {
+                return Ok(());
+            }
+        }
+    }
+
+    // A 2022 mint may legitimately ship without extensions (82 bytes, the only
+    // length below 166 that passes the check above): nothing to scan.
+    if data.len() <= TOKEN_2022_ACCOUNT_BASE_LEN {
+        return Ok(());
+    }
+    require!(data[TOKEN_2022_ACCOUNT_BASE_LEN] == 1, WagonError::TierBMalformedMint);
+
+    let mut cursor: usize = TOKEN_2022_ACCOUNT_BASE_LEN + 1;
+    while cursor + 4 <= data.len() {
+        let ext_type = u16::from_le_bytes([data[cursor], data[cursor + 1]]);
+        let ext_len = u16::from_le_bytes([data[cursor + 2], data[cursor + 3]]) as usize;
+        cursor = cursor.checked_add(4).ok_or(WagonError::TierBExtensionParseError)?;
+        let ext_end = cursor.checked_add(ext_len).ok_or(WagonError::TierBExtensionParseError)?;
+        require!(ext_end <= data.len(), WagonError::TierBExtensionParseError);
+        let ext_data = &data[cursor..ext_end];
+
+        match ext_type {
+            0 => break, // Uninitialized terminator
+            EXT_TRANSFER_FEE_CONFIG => return err!(WagonError::TierB2022TransferFee),
+            EXT_CONFIDENTIAL_TRANSFER_MINT => {
+                return err!(WagonError::TierB2022ConfidentialTransfer)
+            }
+            EXT_DEFAULT_ACCOUNT_STATE => {
+                // DefaultAccountState: u8 state at offset 0.
+                // 1 = Initialized (depositor ATAs spawn usable) — OK.
+                // 2 = Frozen (depositor ATAs spawn unusable) — REJECT.
+                require!(!ext_data.is_empty(), WagonError::TierBExtensionParseError);
+                if ext_data[0] == 2 {
+                    return err!(WagonError::TierB2022DefaultFrozen);
+                }
+            }
+            EXT_NON_TRANSFERABLE => return err!(WagonError::TierB2022NonTransferable),
+            EXT_PERMANENT_DELEGATE => return err!(WagonError::TierB2022PermanentDelegate),
+            EXT_TRANSFER_HOOK => {
+                // TransferHook: 32 bytes authority + 32 bytes program_id.
+                // Reject if program_id != all zeros (i.e. a hook is wired up).
+                require!(ext_data.len() >= 64, WagonError::TierBExtensionParseError);
+                let program_id_bytes = &ext_data[32..64];
+                if program_id_bytes.iter().any(|&b| b != 0) {
+                    return err!(WagonError::TierB2022TransferHook);
+                }
+            }
+            EXT_CONFIDENTIAL_TRANSFER_FEE => {
+                return err!(WagonError::TierB2022ConfidentialTransfer)
+            }
+            // #55: familia confidencial completa (antes el 24 caía al catch-all
+            // porque la tabla lo creía ScaledUiAmount).
+            EXT_CONFIDENTIAL_MINT_BURN => {
+                return err!(WagonError::TierB2022ConfidentialTransfer)
+            }
+            // #55: el arm decía 25 (= ScaledUiAmount, inocuo) — el Pausable real
+            // es el 26 y hasta hoy se ACEPTABA en silencio para mints no trusted.
+            EXT_PAUSABLE => return err!(WagonError::TierB2022Pausable),
+            // Other extensions are safe to HOLD (metadata, group, ScaledUiAmount(25):
+            // la UI escala y, desde G2-d, el m2m y el guard valoran átomos × su
+            // multiplicador efectivo; PausableAccount(27) — extensión de cuenta,
+            // nunca de mint, ...)
+            _ => {}
+        }
+        cursor = ext_end;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests unitarios (#55): Tier-B contra los bytes REALES del mint SPYx (fixture
+// compartida en `token_io::test_fixtures`). Las variantes se fabrican por
+// cirugía localizada del TLV; los mints con authority NO trusted ejercitan el
+// walker completo (los trusted cortan antes por short-circuit).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tier_b_tests {
+    use super::verify_token2022_extensions;
+    use crate::token_io::test_fixtures::{find_ext, set_ext_type, spyx_bytes};
+    use crate::token_io::{
+        EXT_CONFIDENTIAL_MINT_BURN, EXT_CONFIDENTIAL_TRANSFER_MINT, EXT_DEFAULT_ACCOUNT_STATE,
+        EXT_METADATA_POINTER, EXT_NON_TRANSFERABLE, EXT_PAUSABLE, EXT_PERMANENT_DELEGATE,
+        EXT_SCALED_UI_AMOUNT, EXT_TRANSFER_FEE_CONFIG,
+    };
+
+    /// Tipo aceptado e inerte para NEUTRALIZAR una extensión en una variante
+    /// (3 = MintCloseAuthority; el walker no mira su payload).
+    const EXT_INERTE: u16 = 3;
+
+    fn assert_err_contiene(res: anchor_lang::Result<()>, nombre: &str) {
+        let dbg = format!("{:?}", res);
+        assert!(
+            dbg.contains(nombre),
+            "esperaba error {nombre}, resultado: {dbg}"
+        );
+    }
+
+    /// SPYx real con la mint_authority sustituida (deja de ser Backed) para
+    /// saltar el short-circuit trusted y ejercitar el walker de extensiones.
+    fn spyx_no_trusted() -> Vec<u8> {
+        let mut d = spyx_bytes();
+        for b in &mut d[4..36] {
+            *b = 7;
+        }
+        d
+    }
+
+    fn neutraliza(d: &mut [u8], ext_type: u16) {
+        let (p, _) = find_ext(d, ext_type).expect("extension ausente en la fixture");
+        set_ext_type(d, p, EXT_INERTE);
+    }
+
+    /// El short-circuit trusted (Backed) sigue intacto: el SPYx REAL pasa
+    /// entero, con PermanentDelegate y todo.
+    #[test]
+    fn trusted_short_circuit_intacto() {
+        assert!(verify_token2022_extensions(&spyx_bytes()).is_ok());
+    }
+
+    /// Un mint NO trusted con PermanentDelegate se rechaza (primera extensión
+    /// peligrosa del SPYx en orden de TLV).
+    #[test]
+    fn no_trusted_permanent_delegate_rechazado() {
+        assert_err_contiene(
+            verify_token2022_extensions(&spyx_no_trusted()),
+            "TierB2022PermanentDelegate",
+        );
+    }
+
+    /// #55: ScaledUiAmount (25) se ACEPTA para no-trusted — la intención
+    /// original del doc-comment, rota por la tabla corrida (el arm viejo «25»
+    /// lo rechazaba creyéndolo Pausable). Desde G2-d su multiplicador entra en
+    /// la valoración; el alta del feed (`set_feed`, solo Squads) es la puerta.
+    #[test]
+    fn no_trusted_scaled_ui_aceptado() {
+        let mut d = spyx_no_trusted();
+        neutraliza(&mut d, EXT_PERMANENT_DELEGATE);
+        neutraliza(&mut d, EXT_CONFIDENTIAL_TRANSFER_MINT);
+        neutraliza(&mut d, EXT_PAUSABLE);
+        assert!(
+            verify_token2022_extensions(&d).is_ok(),
+            "ScaledUiAmount + resto de extensiones inocuas debe pasar"
+        );
+    }
+
+    /// #55: el Pausable REAL (26) se RECHAZA para no-trusted — hasta hoy caía
+    /// al catch-all y se aceptaba en silencio. La ext 25 se neutraliza ADREDE
+    /// (revision adversarial #55): con la tabla vieja el arm «25» levantaba el
+    /// MISMO error al llegar al ScaledUiAmount y el test pasaba por la razon
+    /// equivocada; asi, el unico camino al error es el arm 26.
+    #[test]
+    fn no_trusted_pausable_real_rechazado() {
+        let mut d = spyx_no_trusted();
+        neutraliza(&mut d, EXT_PERMANENT_DELEGATE);
+        neutraliza(&mut d, EXT_CONFIDENTIAL_TRANSFER_MINT);
+        neutraliza(&mut d, EXT_SCALED_UI_AMOUNT);
+        assert_err_contiene(verify_token2022_extensions(&d), "TierB2022Pausable");
+    }
+
+    /// DefaultAccountState = Frozen (arm 6, el otro arm condicional y de dinero:
+    /// las ATAs del depositante nacerian congeladas). El SPYx real trae 01
+    /// (Initialized); la variante lo pone a 02.
+    #[test]
+    fn no_trusted_default_frozen_rechazado() {
+        let mut d = spyx_no_trusted();
+        neutraliza(&mut d, EXT_PERMANENT_DELEGATE);
+        let (p, l) = find_ext(&d, EXT_DEFAULT_ACCOUNT_STATE).unwrap();
+        assert_eq!(l, 1);
+        d[p] = 2; // Frozen
+        assert_err_contiene(verify_token2022_extensions(&d), "TierB2022DefaultFrozen");
+    }
+
+    /// TransferFeeConfig (1): el vault sangraria valor en cada swap.
+    #[test]
+    fn no_trusted_transfer_fee_rechazado() {
+        let mut d = spyx_no_trusted();
+        let (p, _) = find_ext(&d, EXT_METADATA_POINTER).unwrap();
+        set_ext_type(&mut d, p, EXT_TRANSFER_FEE_CONFIG);
+        assert_err_contiene(verify_token2022_extensions(&d), "TierB2022TransferFee");
+    }
+
+    /// NonTransferable (9): el vault jamas podria liquidar.
+    #[test]
+    fn no_trusted_non_transferable_rechazado() {
+        let mut d = spyx_no_trusted();
+        let (p, _) = find_ext(&d, EXT_METADATA_POINTER).unwrap();
+        set_ext_type(&mut d, p, EXT_NON_TRANSFERABLE);
+        assert_err_contiene(verify_token2022_extensions(&d), "TierB2022NonTransferable");
+    }
+
+    /// TransferHook ARMADO (14): el SPYx real lo trae DESARMADO (program_id a
+    /// ceros y por eso el mint real pasa); la variante lo arma.
+    #[test]
+    fn no_trusted_hook_armado_rechazado() {
+        let mut d = spyx_no_trusted();
+        neutraliza(&mut d, EXT_PERMANENT_DELEGATE);
+        neutraliza(&mut d, EXT_CONFIDENTIAL_TRANSFER_MINT);
+        neutraliza(&mut d, EXT_SCALED_UI_AMOUNT);
+        neutraliza(&mut d, EXT_PAUSABLE);
+        let (p, l) = find_ext(&d, crate::token_io::EXT_TRANSFER_HOOK).unwrap();
+        assert_eq!(l, 64);
+        d[p + 40] = 0xAB; // program_id != 0
+        assert_err_contiene(verify_token2022_extensions(&d), "TierB2022TransferHook");
+    }
+
+    /// Discriminador de cuenta que no es Mint (data[165] != 1) => malformado.
+    #[test]
+    fn no_trusted_discriminador_no_mint_rechazado() {
+        let mut d = spyx_no_trusted();
+        d[165] = 2;
+        assert_err_contiene(verify_token2022_extensions(&d), "TierBMalformedMint");
+    }
+
+    /// Endurecimiento de la #56 (Kairo F-10): ninguna longitud de 83 a 165 ni la de un multisig (355) es un mint de
+    /// Token-2022: se rechazan antes de todo, también con la autoridad de un emisor de confianza.
+    #[test]
+    fn longitudes_que_no_son_un_mint_se_rechazan_aunque_sea_trusted() {
+        for len in (83..=165).chain(std::iter::once(355)) {
+            for base in [spyx_bytes(), spyx_no_trusted()] {
+                let mut d = base;
+                d.resize(len, 0);
+                assert_err_contiene(verify_token2022_extensions(&d), "TierBMalformedMint");
+            }
+        }
+    }
+
+    /// Un mint de Token-2022 sin extensiones (82 bytes) no tiene nada que escanear.
+    #[test]
+    fn mint_sin_extensiones_de_82_bytes_pasa() {
+        let mut d = spyx_no_trusted();
+        d.truncate(82);
+        assert!(verify_token2022_extensions(&d).is_ok());
+    }
+
+    /// #55: ConfidentialMintBurn (24) se RECHAZA (familia confidencial, como 4
+    /// y 16) — antes caía al catch-all porque la tabla lo creía ScaledUiAmount.
+    #[test]
+    fn no_trusted_confidential_mint_burn_rechazado() {
+        let mut d = spyx_no_trusted();
+        neutraliza(&mut d, EXT_PERMANENT_DELEGATE);
+        neutraliza(&mut d, EXT_CONFIDENTIAL_TRANSFER_MINT);
+        let (p, _) = find_ext(&d, EXT_SCALED_UI_AMOUNT).unwrap();
+        set_ext_type(&mut d, p, EXT_CONFIDENTIAL_MINT_BURN);
+        assert_err_contiene(
+            verify_token2022_extensions(&d),
+            "TierB2022ConfidentialTransfer",
+        );
+    }
+}

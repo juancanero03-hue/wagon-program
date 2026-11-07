@@ -1,0 +1,25 @@
+[workspace]
+members = ["programs/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+authors = ["Wagon Labs"]
+license = "MIT"
+edition = "2021"
+
+# solana-verify (build reproducible y sello F-01) elige con esto la imagen de Docker: la versión de Agave del compilador v3 de
+# la CI (COMPILADOR_VERSION de .github/scripts/instalar-solana.sh; comprobar-version-compilador.py exige que coincidan). Cargo
+# ignora esta sección: no cambia ni el binario ni el Cargo.lock.
+[workspace.metadata.cli]
+solana = "4.3.0"
+
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1
+
+[profile.release.build-override]
+opt-level = 3
+incremental = false
+codegen-units = 1

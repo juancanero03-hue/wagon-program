@@ -1,0 +1,1049 @@
+[toolchain]
+anchor_version = "0.30.1"
+solana_version = "1.18.22"
+
+[features]
+resolution = true
+skip-lint = false
+
+# Program IDs. `wagon` matches `declare_id!` in programs/wagon/src/lib.rs —
+# fresh keypair (2026-04-24) used for both devnet and mainnet. Source keypair
+# stored outside the repo; upgrade authority on mainnet will be transferred
+# to the Squads multisig vault (Wagon Protocol, 2-of-3) before raising the
+# TVL cap beyond bootstrap.
+# `mock_jupiter` matches `declare_id!` in programs/mock-jupiter/src/lib.rs; it
+# is deployed only on localnet (never devnet/mainnet) and is used by the
+# deposit/withdraw test suite when the wagon program is built with
+# `--features mock-jupiter`.
+[programs.localnet]
+wagon = "2kZqCjGfKgVR8dUkv4PCogFsFgN3EoSSNX41HN1cBfBA"
+mock_jupiter = "5XTrg9h1vGodDJv71xtv8ghvcVk5vWCaCuxGAi8ZmGww"
+
+[programs.devnet]
+wagon = "2kZqCjGfKgVR8dUkv4PCogFsFgN3EoSSNX41HN1cBfBA"
+
+[programs.mainnet]
+wagon = "2kZqCjGfKgVR8dUkv4PCogFsFgN3EoSSNX41HN1cBfBA"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "localnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+# Mocha runs all tests; `ts-mocha` transpiles on the fly, no build step needed.
+# The mock-jupiter-gated suites (04_deposit, 05_withdraw) read
+# `WAGON_MOCK_JUPITER=1` to switch TS-side USDC/Jupiter constants to the
+# fixture addresses. The on-chain wagon program must be built with the
+# matching `--features mock-jupiter` — do that via `anchor test
+# --skip-deploy -- --features mock-jupiter`, or run `cargo build-sbf
+# --features mock-jupiter` and `solana program deploy` manually before
+# `anchor run test`.
+test = "npx ts-mocha -p ./tsconfig.json -t 1000000 --require ./tests/_shared/guardaRegistro.ts 'tests/**/*.ts'"
+# One-off ops script: seeds the allowed-mint registry with the Top 20 xStocks.
+# Idempotent (already-present mints are skipped). Before running against any
+# live cluster, edit `migrations/seed-allowed-mints.ts` and replace the
+# PLACEHOLDER entries with the real Backed Solana mint addresses from
+# https://backed.fi. In Phase 5 (Squads multisig) this must be routed as a
+# proposal — the authority signer is the protocol authority, not a dev key.
+seed-allowed-mints = "npx ts-node migrations/seed-allowed-mints.ts"
+
+[test]
+startup_wait = 15000
+shutdown_wait = 2000
+upgradeable = false
+
+[test.validator]
+# Anchor 0.30.1 pasa por defecto --bind-address 0.0.0.0 y el solana-test-validator de Agave 4.3.2 (el de las suites desde el
+# 26-oct-2026, instalar-solana.sh --validador) se para al arrancar con `UnspecifiedIpAddr(0.0.0.0)`. El 1.18.22 también vale así.
+bind_address = "127.0.0.1"
+# Clone mainnet state so USDC mint / Jupiter program exist on our local
+# validator in non-mock runs. When running the mock-jupiter suites the
+# clones are unused (the suites create a fresh test USDC mint and deploy
+# the mock-jupiter .so themselves, controlled via `WAGON_MOCK_JUPITER=1`).
+url = "https://api.mainnet-beta.solana.com"
+
+[[test.validator.clone]]
+address = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"  # USDC mint
+
+[[test.validator.clone]]
+address = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"  # Jupiter v6 program
+
+[[test.validator.clone]]
+address = "So11111111111111111111111111111111111111112"   # Wrapped SOL
+
+[[test.validator.clone]]
+address = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"  # Metaplex Token Metadata (create_vault CPI)
+
+# Ceremonia #55: el Token-2022 EMBEBIDO en solana-test-validator 1.18.22 es
+# antiguo (su TokenInstruction termina en el 41): no conoce ScaledUiAmount(43)
+# ni Pausable(44) y la suite 31 muere con "Invalid instruction" al crear el
+# mint gemelo del SPYx. Clonamos el binario VIVO de mainnet (el mismo programa
+# que ejecuta los xStocks reales) igual que ya hacemos con Jupiter v6; el clon
+# de genesis SOMBREA al builtin en ambos jobs del CI.
+[[test.validator.clone]]
+address = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"  # SPL Token-2022 (moderno, con exts 25/26)
+
+[[test.validator.clone]]
+address = "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So"   # mSOL (basket fixture, null freeze auth -> passes Tier B)
+
+[[test.validator.clone]]
+address = "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1"   # bSOL (basket fixture, null freeze auth -> passes Tier B)
+
+# Upgrade #30 (mark-to-market): static PriceUpdateV2 fixtures owned by the
+# Pyth receiver program id. publish_time 2050 = always fresh (deterministic,
+# no pretest generator); the STALE one is 1970 = always stale. Built by
+# tests/_shared/fixtures/README note; layout mirrors pyth-solana-receiver-sdk
+# PriceUpdateV2 (borsh, VerificationLevel::Full).
+# CISO-P3 (#56): el programa solo acepta la cuenta OFICIAL v2 de cada feed, así que
+# cada fixture está en la PDA del programa push v2 de Pyth con [0u16 LE, feed id] y
+# es del receptor v2 (rec2HH...); la SOL/USD cae en su dirección real de mainnet.
+# Excepciones a propósito: A VIEJA (fuera de la dirección oficial, la cuenta del
+# ataque de la suite 105), C40 v1 (la oficial de la generación vieja) y C40 ajena.
+
+[[test.validator.account]]
+address = "FspYxwwNGsZkPLdLZwxqvgwR6GZuJ6APtqKuUYAvrtN7"  # pyth fixture A (price 2000, expo 0)
+filename = "tests/_shared/fixtures/pyth-a.json"
+
+[[test.validator.account]]
+address = "9poXMXW8qopEJ76udQ3adRWLKX8qpXNAfzHJb43Fwh1h"  # pyth A VIEJA: MISMO feed que A, price 1960, publicada 110 s antes, NO en la dirección oficial (CISO-P3)
+filename = "tests/_shared/fixtures/pyth-a-viejo.json"
+
+[[test.validator.account]]
+address = "7NrAMfs2GSQNZcLB6wYr4dym5Ar1DzbVJ7AjB4mPEazR"  # pyth fixture B (price 500, expo 0)
+filename = "tests/_shared/fixtures/pyth-b.json"
+
+[[test.validator.account]]
+address = "4NVUNnTbUyfUyF18VmUNRNc1Cawg7xDkKn4vFNiM9xLm"  # pyth fixture STALE (publish_time 1970)
+filename = "tests/_shared/fixtures/pyth-stale.json"
+
+[[test.validator.account]]
+address = "82X95MBMkR97eTT2a8LskZ9xp4UD5rEJ3eo14QnJPyxn"  # pyth fixture WIDE (conf 30%)
+filename = "tests/_shared/fixtures/pyth-wide.json"
+
+[[test.validator.account]]
+address = "7AviUf9nL62mcxNbQGKm4nKDQnPjswo6c5MX4D57HmyE"  # pyth fixture SOL/USD (feed id REAL, price 100 USD expo -8)
+filename = "tests/_shared/fixtures/pyth-sol.json"
+
+[[test.validator.account]]
+address = "5VXM1DRL5ykkasniG79Ds835yaeD6Enrb8pnjzgy8UQa"  # pyth SOL/USD NO oficial: mismos bytes que pyth-sol fuera de la dirección oficial (CISO-P3, suite 105)
+filename = "tests/_shared/fixtures/pyth-sol-no-oficial.json"
+
+# CISO-P3 B (#56): fixtures de la suite 107 (edad del precio en el commit), en su dirección oficial v2. Lo commiteado está
+# rancio (publish_time 1); el paso «Prueba de edad» de anchor-test.yml las reescribe con la hora real justo antes de su
+# propio validador (gen-pyth-edad.py --ahora).
+[[test.validator.account]]
+address = "9SjGth21R7sKuTU5X66W74QyfNtUxjrW8sNCjS5xxdf2"  # pyth EDAD (precio 2000, expo 0; suite 107)
+filename = "tests/_shared/fixtures/pyth-edad.json"
+
+[[test.validator.account]]
+address = "3mTHgNYBFjvWUM1dpyUgUVDLDkQeNZgwAWNtYQAakimX"  # pyth EDAD-SOL (100 USD, expo -8: SOL de la pata compuesta; suite 107)
+filename = "tests/_shared/fixtures/pyth-edad-sol.json"
+
+# Ceremonia #40 (2026-07-29) — RECEPTOR DOBLE de Pyth. Las tres cuentas llevan
+# EXACTAMENTE los mismos 133 bytes (feed id sha256("wagon-test-feed:C40"),
+# precio 1500, expo 0, publish_time 2050 = fresca para siempre). Lo ÚNICO que
+# cambia entre ellas es el `owner`, que es justo lo que valida read_pyth_price:
+#   v1    -> receptor del SDK (rec5EK...), la generación VIEJA
+#   v2    -> receptor NUEVO (rec2HH...), al que Pyth movió sus cuentas de precio
+#   alien -> un tercer programa cualquiera: DEBE rechazarse (InvalidPriceAccount)
+# Sin la fixture v2 la CI saldría verde sin haber ejercitado nunca el receptor
+# nuevo, que es el motivo entero de esta ceremonia.
+# CISO-P3 (#56): desde la #56 solo vale v2; cada una está en la dirección OFICIAL de
+# su generación y la v1 también DEBE rechazarse (InvalidPriceAccount).
+
+# Ceremonia USDC §3.3 (B3, 2026-09-24) — fixtures de génesis de la suite 50: registros `FundingRecord` HUÉRFANOS
+# (`funding_reclaim_stale`): r1 sin sesión · r2 + s2 sesión legacy (sello 0) · r3 + s3 sesión VIVA con el mismo
+# sello (debe revertir) · r5 + s5 misma generación pero OTRO tipo · r6 + s6 mismos 32 bits bajos y otros altos;
+# y cambios de cesta COLGADOS (vault status 4 + sesión fuera de plazo) para el abort por un TERCERO: A y B
+# patrocinados (rA, rB), L legacy. Generadas con tests/_shared/fixtures/gen-funding-b3.mjs (seeds fijas;
+# rentEpoch escrito a mano, gotcha 33).
+
+[[test.validator.account]]
+address = "4ie3RP5aaz7tdusjCfpWfQ6N1KYSYo8ukwWFLEb8Hht9"  # B3 fixture r1
+filename = "tests/_shared/fixtures/funding-b3-r1.json"
+
+[[test.validator.account]]
+address = "CgnJXzWyWDMFgxgJXiSndfayQCrKS46tnQV3wTcPcjPm"  # B3 fixture r2
+filename = "tests/_shared/fixtures/funding-b3-r2.json"
+
+[[test.validator.account]]
+address = "EwXbgzuKJ71CnZ6eWupunqUTCYWT3x7Pk4EdXyhfGCVJ"  # B3 fixture s2
+filename = "tests/_shared/fixtures/funding-b3-s2.json"
+
+[[test.validator.account]]
+address = "AsmjySpQ8JeSPbyCmagmzTZLggS2r8oVFRSXApYVoK8G"  # B3 fixture r3
+filename = "tests/_shared/fixtures/funding-b3-r3.json"
+
+[[test.validator.account]]
+address = "9oPAfzACyWZ5cpL68wTGGsDLKeFgnLmqdZeGmVWTTiwn"  # B3 fixture s3
+filename = "tests/_shared/fixtures/funding-b3-s3.json"
+
+[[test.validator.account]]
+address = "3D2V66fYDgCnitLmTS8qoD8SkZACjZaFLxQ7dQc82xN2"  # B3 fixture r5
+filename = "tests/_shared/fixtures/funding-b3-r5.json"
+
+[[test.validator.account]]
+address = "3tgTuiVEVetq7Vo6rdb45aTWTTpqfv5HyjcfRzYaqcHN"  # B3 fixture s5
+filename = "tests/_shared/fixtures/funding-b3-s5.json"
+
+[[test.validator.account]]
+address = "ABizs6Q2Guftqg4XR6GH2zCX5jhM4Uk32BK9DjF5qiE6"  # B3 fixture r6
+filename = "tests/_shared/fixtures/funding-b3-r6.json"
+
+[[test.validator.account]]
+address = "7JiEQCi5MUJsaYt9ZVhZPUttMTZLqTDakj6ovxJCNeuj"  # B3 fixture s6
+filename = "tests/_shared/fixtures/funding-b3-s6.json"
+
+[[test.validator.account]]
+address = "8ocHRLiqwSBvrXjY9dVewAZchmeoqhqnC8hS8Z8s8W4y"  # B3 fixture vA
+filename = "tests/_shared/fixtures/funding-b3-vA.json"
+
+[[test.validator.account]]
+address = "3kRp5WgZ5bebbi57LPJiEfGtMbJDHSYcf8ScbnmvifWQ"  # B3 fixture sA
+filename = "tests/_shared/fixtures/funding-b3-sA.json"
+
+[[test.validator.account]]
+address = "8wR3Tk1zKr5hamQKuRdZvieVsfn2fSkT7rtVby8NHaUp"  # B3 fixture rA
+filename = "tests/_shared/fixtures/funding-b3-rA.json"
+
+[[test.validator.account]]
+address = "BwTxd9NDaMUYqy6rZf31BHN6nH1VnH5ryb2do1tBmXD2"  # B3 fixture vB
+filename = "tests/_shared/fixtures/funding-b3-vB.json"
+
+[[test.validator.account]]
+address = "Hc452YkxWvqpEMj5CU6DL4jiiPSuqjjhsC48QqJng8G2"  # B3 fixture sB
+filename = "tests/_shared/fixtures/funding-b3-sB.json"
+
+[[test.validator.account]]
+address = "349BqDxqUg41CLNpYw1k2nwQjovsD1msrwuyDqicuXio"  # B3 fixture rB
+filename = "tests/_shared/fixtures/funding-b3-rB.json"
+
+[[test.validator.account]]
+address = "AAFZkTsf6BEmVA51jVFBVCUwQAmNVkd6jcM6YJp8B6SH"  # B3 fixture vL
+filename = "tests/_shared/fixtures/funding-b3-vL.json"
+
+[[test.validator.account]]
+address = "3WndotbFjeou7wkXAbj93oVQtid1hhFMPvvvfWcbTcMf"  # B3 fixture sL
+filename = "tests/_shared/fixtures/funding-b3-sL.json"
+
+# DT-E (PR B, 2026-09-28) — fixtures de génesis de las suites 60 y 61: vault X con su ATA USDC CONGELADA y dos
+# sesiones de depósito COMPROMETIDAS fuera de plazo, barridas enteras, que deposit_force_release ya no libera (6180;
+# F1 con la ATA del vault congelada, F2 con la hucha congelada); sesiones ANTIGUAS de 457 B para deposit_session_migrate (L con 10 USDC;
+# L2 comprometida con la hucha congelada) y dos que NO lo son (N1 fuera de su PDA; N2 de otro dueño). Generadas con
+# tests/_shared/fixtures/gen-dte.mjs (seeds fijas; rentEpoch a mano, gotcha 33).
+
+[[test.validator.account]]
+address = "GQiqgrhnXLEW4NBSVsPgNymvL7X9MZfYrYgw1DMBKLU1"  # DT-E fixture vX
+filename = "tests/_shared/fixtures/dte-vX.json"
+
+[[test.validator.account]]
+address = "AFtsZy3j7X1SRG3gk7sSz8ZR2vUrbJm2kMTNL1tdwQVJ"  # DT-E fixture uX
+filename = "tests/_shared/fixtures/dte-uX.json"
+
+[[test.validator.account]]
+address = "2NHKtXeZuiZkxDdEP99zZoHjknj9tDNUnE3oLMuZyuZS"  # DT-E fixture sF1
+filename = "tests/_shared/fixtures/dte-sF1.json"
+
+[[test.validator.account]]
+address = "EpiRB33bmTQzLYCdZLUoi1rUYhKZZ96QtDkwCpayesRd"  # DT-E fixture eF1
+filename = "tests/_shared/fixtures/dte-eF1.json"
+
+[[test.validator.account]]
+address = "7RJfobPNzUg6t9XQGVtnELpaqNR6t56677thdxhSHn2D"  # DT-E fixture sF2
+filename = "tests/_shared/fixtures/dte-sF2.json"
+
+[[test.validator.account]]
+address = "BKtH7fex4uAmBcuHjczvjmQUDqXTr9zWD4wUBTSFUUyL"  # DT-E fixture eF2
+filename = "tests/_shared/fixtures/dte-eF2.json"
+
+[[test.validator.account]]
+address = "3ipYjDx4SXB1PG9Nbpe3xvNDHDjrcx67q6UsUcQKRVVE"  # DT-E fixture sL
+filename = "tests/_shared/fixtures/dte-sL.json"
+
+[[test.validator.account]]
+address = "Adq1ct8fa6qape4wKoGQFnPHfoMCEv7n8XtFU2jPXc2w"  # DT-E fixture eL
+filename = "tests/_shared/fixtures/dte-eL.json"
+
+[[test.validator.account]]
+address = "75sR7ABxNU7cdkz5s1tw5NMmkgZASGMRLsvdMMdGzpm9"  # DT-E fixture sL2
+filename = "tests/_shared/fixtures/dte-sL2.json"
+
+[[test.validator.account]]
+address = "ApXYBB9D3o7pMpboWYg3rHYJSzwgj7r4dJuB41m7EQmw"  # DT-E fixture eL2
+filename = "tests/_shared/fixtures/dte-eL2.json"
+
+[[test.validator.account]]
+address = "3ACKWrWdPAGgLKY7RG27dz8gzoFEnPnLta3rptXZ54mt"  # DT-E fixture sN1
+filename = "tests/_shared/fixtures/dte-sN1.json"
+
+[[test.validator.account]]
+address = "7tFy42P8EewkLZVeyhJyeVPHohZ2pTTdh2m2Y8umME83"  # DT-E fixture sN2
+filename = "tests/_shared/fixtures/dte-sN2.json"
+
+[[test.validator.account]]
+address = "7GbRP7PLa2ViaTYdinBbjrpPxKrmtRVdbkQVz3TNhi21"  # DT-E fixture sL3 (G2-c: 473 B, migrate append-only)
+filename = "tests/_shared/fixtures/dte-sL3.json"
+
+[[test.validator.account]]
+address = "4cwpoKVDxuMrdkNhkhWW25pUyWyBTKgNBRE2nbWrTSRf"  # DT-E fixture eL3
+filename = "tests/_shared/fixtures/dte-eL3.json"
+
+[[test.validator.account]]
+address = "Eg4rRpcdHiXoSKvpxcpUAXfJG88PnvcnocmSM5DXuMsq"  # pyth C40 · receptor VIEJO (SDK)
+filename = "tests/_shared/fixtures/pyth-c40-v1.json"
+
+[[test.validator.account]]
+address = "CEHXYw934dedeePCSPRSXGfqRfq2um59jjqEE4ztmp5r"  # pyth C40 · receptor NUEVO
+filename = "tests/_shared/fixtures/pyth-c40-v2.json"
+
+[[test.validator.account]]
+address = "AsfWndgJ9PA3pwoGyhWLK528WBnta3roevouSdXFLSPp"  # pyth C40 · programa AJENO (debe fallar)
+filename = "tests/_shared/fixtures/pyth-c40-alien.json"
+
+
+# Retirada del AllowedMintRegistry (2026-07-03): copia byte a byte de la
+# cuenta REAL de mainnet (PDA [allowed-mints], 3.659 B, 26.357.520 lamports)
+# para testear close_allowed_mint_registry E2E — rent recuperado incluido.
+[[test.validator.account]]
+address = "2McC6VQbTRqnt4cmKayY7AZWJVKVfDLARj3vtbUbg5Pt"  # allowed-mint registry (muerto)
+filename = "tests/_shared/fixtures/allowed-mints.json"
+
+# G1 (revisión N3 del PR #57, 2026-10-09): fixtures de génesis de la suite 74 (vault con una cancelación
+# empezada antes del upgrade y sesiones de retiro con generación 0). Generador: tests/_shared/fixtures/gen-g1.mjs.
+[[test.validator.account]]
+address = "AAagEiBTiswSSgJwKdntTuhuXhWCY2gxMzvjrAMFGTAM"  # G1 fixture vY
+filename = "tests/_shared/fixtures/g1-vY.json"
+
+[[test.validator.account]]
+address = "2J4GMYciNP12MLGp7jHwkSaoUkDYjucfjyK8B1VAg52U"  # G1 fixture uY
+filename = "tests/_shared/fixtures/g1-uY.json"
+
+[[test.validator.account]]
+address = "vDsMfnQv4CMP2FDv8p7F772eMNJypQx2JchFDxYHhpL"  # G1 fixture mG
+filename = "tests/_shared/fixtures/g1-mG.json"
+
+[[test.validator.account]]
+address = "2i1sPu5NJBZ6h3GgHXcHwgG6uaP1acU94Gm2jHDdKuwJ"  # G1 fixture sL1
+filename = "tests/_shared/fixtures/g1-sL1.json"
+
+[[test.validator.account]]
+address = "HV1xnv71JoenFw9DQrMWuLbAvsshV5FfnMd9o5PrLDws"  # G1 fixture eL1
+filename = "tests/_shared/fixtures/g1-eL1.json"
+
+[[test.validator.account]]
+address = "BGwFWtcg9MteMqkDsFnu7qCEekrGx4CJEHhEMSeUKr8K"  # G1 fixture sL2
+filename = "tests/_shared/fixtures/g1-sL2.json"
+
+[[test.validator.account]]
+address = "8zBwhwbcUptsSnKcFWD1UHG3naV7evBvxgkYog8eEKeK"  # G1 fixture pL2
+filename = "tests/_shared/fixtures/g1-pL2.json"
+
+# G2-b (revisión N3, 2026-10-10): fixtures de génesis del caso 4 de la suite 70 (vault Z con tabla [USDC, A] y una sesión
+# de depósito TRIVIAL de generación 0 cuya foto es [A, USDC]: el settle la rechaza por deriva, 6141). Generador:
+# tests/_shared/fixtures/gen-g2b.mjs.
+[[test.validator.account]]
+address = "64JcCmEALaFxKjTTB5VpukwHJc6s4U3EhCHJaaGeB2fm"  # G2-b fixture vZ
+filename = "tests/_shared/fixtures/g2b-vZ.json"
+
+[[test.validator.account]]
+address = "7ZNwykHgKYHX8R3xxh3qSr8GNwsBjJ4bzLS2uaUhBPGp"  # G2-b fixture uZ
+filename = "tests/_shared/fixtures/g2b-uZ.json"
+
+[[test.validator.account]]
+address = "BJLT3QBWiXQpUqF1nVBCC4sfcU4AH34mtGi4jk2ruprH"  # G2-b fixture sT
+filename = "tests/_shared/fixtures/g2b-sT.json"
+
+[[test.validator.account]]
+address = "2fX6L73R6AXXW1VNuKq895q4ty2uUxM9T4RR5PhGmHQq"  # G2-b fixture eT
+filename = "tests/_shared/fixtures/g2b-eT.json"
+
+
+# G3 (auditoría 2026-10-09, F1B-01 + decisión 4 de Juan del 14-oct): fixtures de génesis de la suite 81 (vault W de dos patas H y K; sesión C
+# COMPLETA y SIN barrer con sus dos huchas con tokens; sesión D COMPROMETIDA con la pata 1 aún en su hucha; reloj a 0). Generador:
+# tests/_shared/fixtures/gen-g3.mjs.
+[[test.validator.account]]
+address = "8HEAL9wHRVdrfLBmJrXLc52k61LTabU83ApFdxGX8vvv"  # G3 fixture vW
+filename = "tests/_shared/fixtures/g3-vW.json"
+
+[[test.validator.account]]
+address = "Czuk9T6UYYSy6TJ46LMUsiesAdsRXYH5TQX9akRdfJ6E"  # G3 fixture uW
+filename = "tests/_shared/fixtures/g3-uW.json"
+
+[[test.validator.account]]
+address = "95y8Q3RYokBUE3dxT39gS2DXpEYrtQnT5L8yrzB94mUP"  # G3 fixture aH
+filename = "tests/_shared/fixtures/g3-aH.json"
+
+[[test.validator.account]]
+address = "mADxvuBYyhSeg96KmMCEFY3VaW97gzExRgPQBYNXS7r"  # G3 fixture aK
+filename = "tests/_shared/fixtures/g3-aK.json"
+
+[[test.validator.account]]
+address = "A3Yb2FHQnGkcBCZ9MBMF4w6FonZqUUs3PCHZjemic9Xe"  # G3 fixture mH
+filename = "tests/_shared/fixtures/g3-mH.json"
+
+[[test.validator.account]]
+address = "BuYJh9q38PAbxNF6bQEd1xZSotGkpbqHusk1mZ1rzJU9"  # G3 fixture mK
+filename = "tests/_shared/fixtures/g3-mK.json"
+
+[[test.validator.account]]
+address = "9WmztcY8DKyQRas2r2fqQDf8WKXMuiG4NKKwezqj1SFf"  # G3 fixture sC
+filename = "tests/_shared/fixtures/g3-sC.json"
+
+[[test.validator.account]]
+address = "EnRRMcpmonb9UhdXPKKfMCoQkeyhjY9dcgBooXf71Dm5"  # G3 fixture eC0
+filename = "tests/_shared/fixtures/g3-eC0.json"
+
+[[test.validator.account]]
+address = "2jnPWf6EWsocuDiBa6zJaXea5XCAswy9qmfECK7Exv7C"  # G3 fixture eC1
+filename = "tests/_shared/fixtures/g3-eC1.json"
+
+[[test.validator.account]]
+address = "8NGC3vVWN1vrXf4QsLxzm4EvpJyESaG9Ag2URWSSV5xm"  # G3 fixture uC
+filename = "tests/_shared/fixtures/g3-uC.json"
+
+[[test.validator.account]]
+address = "6KeFGhcuV68vL3C6iF9iB2bPyqM4wAeJJj5fih9xeBtE"  # G3 fixture sD
+filename = "tests/_shared/fixtures/g3-sD.json"
+
+[[test.validator.account]]
+address = "9HeDf1vpqqRPS4FvzGPGqcCsRQycskck8gnt4XBcJEzt"  # G3 fixture eD1
+filename = "tests/_shared/fixtures/g3-eD1.json"
+
+[[test.validator.account]]
+address = "HaSJgqgjiQU3UiTwGMCyNVa1A7WXhqMvsDvkZbDZFzfg"  # G3 fixture uD
+filename = "tests/_shared/fixtures/g3-uD.json"
+
+# ---- G3-B1b (16-oct-2026): fixtures de génesis de las suites 88 a 90 (gen-g3b.mjs) ----
+[[test.validator.account]]
+address = "A5nf8m7whWniBNqa6cGnhNku2ZQnxkUs9uKc8nmhNLaz"  # G3-B1b fixture vZ
+filename = "tests/_shared/fixtures/g3b-vZ.json"
+
+[[test.validator.account]]
+address = "3tHMkCHbj9bm3c38X5pMGhwFdavYKS677qp1MRfgNiCf"  # G3-B1b fixture uZ
+filename = "tests/_shared/fixtures/g3b-uZ.json"
+
+[[test.validator.account]]
+address = "2x4QwsDMwRHEcu32BmpQtN2yKYEoZHs9LUJouRxJ7Tx9"  # G3-B1b fixture mP
+filename = "tests/_shared/fixtures/g3b-mP.json"
+
+[[test.validator.account]]
+address = "B52oYDBgEQLNDueyyDBrmXEdUaM6UxiSJXujwsTHiop7"  # G3-B1b fixture mQ
+filename = "tests/_shared/fixtures/g3b-mQ.json"
+
+[[test.validator.account]]
+address = "J7mQCFrELtfC2zuWoGX5rP6ZQBWZZxccgtJMyZhNShfB"  # G3-B1b fixture aP
+filename = "tests/_shared/fixtures/g3b-aP.json"
+
+[[test.validator.account]]
+address = "H5HPRsn1EsACfRkdoXAptV8DjaaoyQ7xpXj8tubreVFK"  # G3-B1b fixture aQ
+filename = "tests/_shared/fixtures/g3b-aQ.json"
+
+[[test.validator.account]]
+address = "8FSfsX5yPJXmPmENXLuSK4KfjMFi3jo4g2RaXw3vepyG"  # G3-B1b fixture sZ
+filename = "tests/_shared/fixtures/g3b-sZ.json"
+
+[[test.validator.account]]
+address = "9vGBFbNRatGFja9R4LuQHTWDzKA96sCphZ6E2S3XgwqH"  # G3-B1b fixture sR1
+filename = "tests/_shared/fixtures/g3b-sR1.json"
+
+[[test.validator.account]]
+address = "DqatyH3pstRWbEg3ouB3JCvfhkFwsZT2FKtW2FohewKk"  # G3-B1b fixture eR1P
+filename = "tests/_shared/fixtures/g3b-eR1P.json"
+
+[[test.validator.account]]
+address = "WqMruV9guaHzYF4W8oNP4KmeoabgBUyfMn9vFgg3vKC"  # G3-B1b fixture eR1Q
+filename = "tests/_shared/fixtures/g3b-eR1Q.json"
+
+[[test.validator.account]]
+address = "3KkNRebuhKzpnZqTj6L81nK5SJho1T5bHi7V8ocktrfD"  # G3-B1b fixture uR1
+filename = "tests/_shared/fixtures/g3b-uR1.json"
+
+[[test.validator.account]]
+address = "BGxZ5cW3hBH5M33yRecyFvzwbH1YbfTBMposZmnUSJ7T"  # G3-B1b fixture pR1
+filename = "tests/_shared/fixtures/g3b-pR1.json"
+
+[[test.validator.account]]
+address = "5ehsCGUsDzQrR1pTQw21pc2mHBdbjbEVusNKKrdf2t72"  # G3-B1b fixture sR2
+filename = "tests/_shared/fixtures/g3b-sR2.json"
+
+[[test.validator.account]]
+address = "C7zVjMFVaBSdTMkFCGxfVjkLDVv1Dy6dRgGewD7WfoXD"  # G3-B1b fixture eR2Q
+filename = "tests/_shared/fixtures/g3b-eR2Q.json"
+
+[[test.validator.account]]
+address = "2jh1hTxn1G1Hti8gPfETQUWB3fB74Umocj9gLxnrYEFG"  # G3-B1b fixture uR2
+filename = "tests/_shared/fixtures/g3b-uR2.json"
+
+[[test.validator.account]]
+address = "F6vc1AW1L8BonKx2VoDD5L33Zew3TU7JRVAazLnAwmyQ"  # G3-B1b fixture pR2
+filename = "tests/_shared/fixtures/g3b-pR2.json"
+
+[[test.validator.account]]
+address = "87ygnP57Ayw6nadAR9kE132wG2Z3seM2fqzCCt8QPSro"  # G3-B1b fixture sR3
+filename = "tests/_shared/fixtures/g3b-sR3.json"
+
+[[test.validator.account]]
+address = "Awtwqctzh9baM6trCM16dtSwh9pK5SZWCXYVG8VgtvmX"  # G3-B1b fixture uR3
+filename = "tests/_shared/fixtures/g3b-uR3.json"
+
+[[test.validator.account]]
+address = "HFFpfVey7ncdDDiVTGwMEQJzPhs9uHx9z9yYronS5EBd"  # G3-B1b fixture pR3
+filename = "tests/_shared/fixtures/g3b-pR3.json"
+
+[[test.validator.account]]
+address = "DRmkfDKZwFwVW42rgZPm2GpSyw6HogRyuzZHkjhE9i1Z"  # G3-B1b fixture sR5
+filename = "tests/_shared/fixtures/g3b-sR5.json"
+
+[[test.validator.account]]
+address = "5rbiXkbgaSRRRwut2bSDFKKJvq9h5vntPHZgmTXEmnSN"  # G3-B1b fixture uR5
+filename = "tests/_shared/fixtures/g3b-uR5.json"
+
+[[test.validator.account]]
+address = "547cJ9vPhmRL1mJf5hsgydCZqME8mMTwwo2i8YVw4fnF"  # G3-B1b fixture pR5
+filename = "tests/_shared/fixtures/g3b-pR5.json"
+
+[[test.validator.account]]
+address = "6jbH6xCQXmSG94KzAJYWQkaTwdhzb7m1q6VcjydxAHQw"  # G3-B1b fixture hR5
+filename = "tests/_shared/fixtures/g3b-hR5.json"
+
+[[test.validator.account]]
+address = "pg22BDzrcCRborfTMndfbixJAEG2HbNxucugH5GwSX7"  # G3-B1b fixture sR6
+filename = "tests/_shared/fixtures/g3b-sR6.json"
+
+[[test.validator.account]]
+address = "73y78xtAhXue3jrmzDQSkJ83d9NVV2oHyKYVF4FN26Nx"  # G3-B1b fixture eR6Q
+filename = "tests/_shared/fixtures/g3b-eR6Q.json"
+
+[[test.validator.account]]
+address = "4gA9KDTBqxWBGiYXUw4nAZ91DRzJ1e2wZBzFJFnn9p5A"  # G3-B1b fixture uR6
+filename = "tests/_shared/fixtures/g3b-uR6.json"
+
+[[test.validator.account]]
+address = "EZ4uycPLZ8czJuEYkNQcoZzxpxoHrLJgRKebCHVRsjdP"  # G3-B1b fixture pR6
+filename = "tests/_shared/fixtures/g3b-pR6.json"
+
+[[test.validator.account]]
+address = "EYjpNJF2Px8YG8H6Cv2hv2XugB69f9UqG9fW6ffXCswc"  # G3-B1b fixture hR6
+filename = "tests/_shared/fixtures/g3b-hR6.json"
+
+[[test.validator.account]]
+address = "6DZqEWy6HmKuLKiYCpep8nBLv4LHdTEbVjGJwmFXjCu"  # G3-B1b fixture sR7
+filename = "tests/_shared/fixtures/g3b-sR7.json"
+
+[[test.validator.account]]
+address = "6Q3DB5MfbvSGK1jYnEVugvYPznj8SJTy6xg3b498wHy"  # G3-B1b fixture eR7P
+filename = "tests/_shared/fixtures/g3b-eR7P.json"
+
+[[test.validator.account]]
+address = "5cHfXR7P7WxBpnBLqNyhuGuQK7vUqRNtqH9XbGsq1AEg"  # G3-B1b fixture eR7Q
+filename = "tests/_shared/fixtures/g3b-eR7Q.json"
+
+[[test.validator.account]]
+address = "7RXccS4o1eUoxi7JmSGkVnzXQFhfMHERBfFz1MTwRTv3"  # G3-B1b fixture uR7
+filename = "tests/_shared/fixtures/g3b-uR7.json"
+
+[[test.validator.account]]
+address = "Dm4Fjf7o8xXj1azU9dNp6BZct5m4AVWBnQzv64SyaCir"  # G3-B1b fixture pR7
+filename = "tests/_shared/fixtures/g3b-pR7.json"
+
+[[test.validator.account]]
+address = "7bCSg9yqbWhJaQTufEf5LfhdE8NVaPf7quToJRcbWGJy"  # G3-B1b fixture sR8
+filename = "tests/_shared/fixtures/g3b-sR8.json"
+
+[[test.validator.account]]
+address = "2JqiSkhh7vEGWG7Gt1uNw5w1YaN7xLySzEUWsUZpXmA7"  # G3-B1b fixture eR8P
+filename = "tests/_shared/fixtures/g3b-eR8P.json"
+
+[[test.validator.account]]
+address = "A6XpVRanM5ydRdGYva3XC7cYf6nVC4FREZ7KQZrJNvbh"  # G3-B1b fixture eR8Q
+filename = "tests/_shared/fixtures/g3b-eR8Q.json"
+
+[[test.validator.account]]
+address = "Hm5MuT9XvJ576tqDw8tPUSdXwbtB6QN92rPhsmsjB1eX"  # G3-B1b fixture uR8
+filename = "tests/_shared/fixtures/g3b-uR8.json"
+
+[[test.validator.account]]
+address = "XWkLcLPpMhuK6at6CrPHfgny82UPVKgA749foztftPz"  # G3-B1b fixture pR8
+filename = "tests/_shared/fixtures/g3b-pR8.json"
+
+[[test.validator.account]]
+address = "3QVaJUFihJELzYYs8E2hCP1L7V9jt8c9iABUmTThv9r2"  # G3-B1b fixture sR9
+filename = "tests/_shared/fixtures/g3b-sR9.json"
+
+[[test.validator.account]]
+address = "FpZm1CqAHLGuey1KBDfxJAUcbXB66ataQRm8VWqh4F7T"  # G3-B1b fixture eR9P
+filename = "tests/_shared/fixtures/g3b-eR9P.json"
+
+[[test.validator.account]]
+address = "Cw8c3vMU7ts7tsSbVUpkQzjpi7dZBFaQ2AN2Xy1gKXBd"  # G3-B1b fixture eR9Q
+filename = "tests/_shared/fixtures/g3b-eR9Q.json"
+
+[[test.validator.account]]
+address = "8QLbnByFVHD9mnimt8kzekWu8rzfMgR3rysMxX1Nc8Pw"  # G3-B1b fixture uR9
+filename = "tests/_shared/fixtures/g3b-uR9.json"
+
+[[test.validator.account]]
+address = "H2zY3gMfVNSz33J3KqVW2HQpDoPq6XZP9vAiD8Ekh935"  # G3-B1b fixture pR9
+filename = "tests/_shared/fixtures/g3b-pR9.json"
+
+[[test.validator.account]]
+address = "Ea7C3hFFHRtxN8AZ1Uwyq6aoPCz1M1PrKypATT5uGu4G"  # G3-B1b fixture sR10
+filename = "tests/_shared/fixtures/g3b-sR10.json"
+
+[[test.validator.account]]
+address = "GfPPjMdLh5RRhizcAGEAXEG9f8ntDKqQdt7YfFAoem4J"  # G3-B1b fixture fR10
+filename = "tests/_shared/fixtures/g3b-fR10.json"
+
+[[test.validator.account]]
+address = "4ncwJUYKmxtYPERcxZXCMLXXaF5fAiPMffxmWqF1eATN"  # G3-B1b fixture eR10P
+filename = "tests/_shared/fixtures/g3b-eR10P.json"
+
+[[test.validator.account]]
+address = "HxdRRTcCyaeFDqx4RH4tuyADBacHpZxJJ575fUSvHjTZ"  # G3-B1b fixture eR10Q
+filename = "tests/_shared/fixtures/g3b-eR10Q.json"
+
+[[test.validator.account]]
+address = "oNA8pjo2TuHAV816Uzy5wSu8TQnFvYSxd2wgtzo9jBz"  # G3-B1b fixture uR10
+filename = "tests/_shared/fixtures/g3b-uR10.json"
+
+[[test.validator.account]]
+address = "E8hrtPipppMjH2GmGh4J4LUr5668YHLWjv72CL6LDtoJ"  # G3-B1b fixture pR10
+filename = "tests/_shared/fixtures/g3b-pR10.json"
+
+[[test.validator.account]]
+address = "H7neXjj5rcXNfycSDzD7JWKtME5xaNSy7zEoNHgrBswU"  # G3-B1b fixture sR11
+filename = "tests/_shared/fixtures/g3b-sR11.json"
+
+[[test.validator.account]]
+address = "5XoykBB2VJv2in3wso72e5WEBT58GaY5u8FUWJXatLLT"  # G3-B1b fixture eR11P
+filename = "tests/_shared/fixtures/g3b-eR11P.json"
+
+[[test.validator.account]]
+address = "Efg8ddoeKJcQjsBjMc9oMVzUUdzYx9XAF5MzAYeS6c1E"  # G3-B1b fixture eR11Q
+filename = "tests/_shared/fixtures/g3b-eR11Q.json"
+
+[[test.validator.account]]
+address = "AqSJ3GcPH4CwnUrGvQdnq8daNpMUNYkEoqnGB3ofMqLr"  # G3-B1b fixture uR11
+filename = "tests/_shared/fixtures/g3b-uR11.json"
+
+[[test.validator.account]]
+address = "CW4MussbtUnjnh2CygFGyfUFECCiTRSLKMwY69bt53Xq"  # G3-B1b fixture pR11
+filename = "tests/_shared/fixtures/g3b-pR11.json"
+
+[[test.validator.account]]
+address = "6TUpS8z75h9tuJuMvHjzYzFqxTDzZZ1hv4MjUraZsNmS"  # G3-B1b fixture vZ2
+filename = "tests/_shared/fixtures/g3b-vZ2.json"
+
+[[test.validator.account]]
+address = "DcnoNxzYnU9gS56gLLEjte1MPX9uj1iDjpWyvtPJ7oa"  # G3-B1b fixture uZ2
+filename = "tests/_shared/fixtures/g3b-uZ2.json"
+
+[[test.validator.account]]
+address = "Ave2o8TexegsXawrZ2rejmEBdM3VwhP16euQ9rfN4Ngu"  # G3-B1b fixture mP2
+filename = "tests/_shared/fixtures/g3b-mP2.json"
+
+[[test.validator.account]]
+address = "Eqk4P3JLvAomu5shCAfard5dVsTiEr8nTFWY96arX7XK"  # G3-B1b fixture mQ2
+filename = "tests/_shared/fixtures/g3b-mQ2.json"
+
+[[test.validator.account]]
+address = "3Z9nkQz1rmuqMihfX2BQ8XPjxGqZeqMCMNu5TppnGBFW"  # G3-B1b fixture aP2
+filename = "tests/_shared/fixtures/g3b-aP2.json"
+
+[[test.validator.account]]
+address = "8qeWBPzcMTVFQBXU1HhFyoxfkE51MxHfBSrwetbwvSiJ"  # G3-B1b fixture aQ2
+filename = "tests/_shared/fixtures/g3b-aQ2.json"
+
+[[test.validator.account]]
+address = "G3Vif1gM9hMMUjDhJuPqzZtDtX75fWB75pSVBGkWWBwD"  # G3-B1b fixture sZ2
+filename = "tests/_shared/fixtures/g3b-sZ2.json"
+
+[[test.validator.account]]
+address = "FkDAsyvKjxM1cB29sjBE9rjiRRxvFjARDbqnLzf9JZbz"  # G3-B1b fixture hR4
+filename = "tests/_shared/fixtures/g3b-hR4.json"
+
+[[test.validator.account]]
+address = "ByCDTfbSQnhkVjuStiDu52j1t9MqT9L8Kt5nhdMPXh4q"  # G3-B1b fixture sR4
+filename = "tests/_shared/fixtures/g3b-sR4.json"
+
+[[test.validator.account]]
+address = "EHdAXZWmGumKiFeaQiGX1Y5VG3nnVsHyuLK78MMupm6M"  # G3-B1b fixture eR4Q
+filename = "tests/_shared/fixtures/g3b-eR4Q.json"
+
+[[test.validator.account]]
+address = "9gn1wpZBVNwHxC6g2W13Rmg9rTNSwkdYC4ndgRjHfM5v"  # G3-B1b fixture uR4
+filename = "tests/_shared/fixtures/g3b-uR4.json"
+
+[[test.validator.account]]
+address = "K25wNAs1bo9ySqedvT4ifrspgPja629pGtNju7tcpEy"  # G3-B1b fixture pR4
+filename = "tests/_shared/fixtures/g3b-pR4.json"
+
+[[test.validator.account]]
+address = "8so3sK7GPVWhK2Dc8H7B3FAr2nQeCEs7WNiQSri1dtUq"  # G3-B1b fixture mB
+filename = "tests/_shared/fixtures/g3b-mB.json"
+
+[[test.validator.account]]
+address = "GWa2T58eZ13kLP6UoNpRduoKtHPmp2J5pCtWhh8cRs1r"  # G3-B1b fixture sR12
+filename = "tests/_shared/fixtures/g3b-sR12.json"
+
+[[test.validator.account]]
+address = "AUCJy8tfQFcjqDks63oXei27uvPaRytb2iRQF6JtAi6L"  # G3-B1b fixture eR12B
+filename = "tests/_shared/fixtures/g3b-eR12B.json"
+
+[[test.validator.account]]
+address = "HaBXUbXZGPk4W5TjYpgiDD6cVASR7XcHz6aA2YyPqhmv"  # G3-B1b fixture eR12Q
+filename = "tests/_shared/fixtures/g3b-eR12Q.json"
+
+[[test.validator.account]]
+address = "CvGFj3jehuMbfuxouMyyeLYjFELKcjcwaijV3e65qnjs"  # G3-B1b fixture uR12
+filename = "tests/_shared/fixtures/g3b-uR12.json"
+
+[[test.validator.account]]
+address = "EFoHLyh9ehp7v3hUCGuVkwJgdRsH2DDMy1FxyfoRLyws"  # G3-B1b fixture pR12
+filename = "tests/_shared/fixtures/g3b-pR12.json"
+
+[[test.validator.account]]
+address = "2u3VmbtovH4eGjFUs4VZEUk3io9Sjmm69e8Z17oG12Hx"  # G3-B1b fixture sR13
+filename = "tests/_shared/fixtures/g3b-sR13.json"
+
+[[test.validator.account]]
+address = "8Y7iBuEHYgi2A83dousRSS9WuEm8Jv1ByXfZrma7DnWH"  # G3-B1b fixture eR13B
+filename = "tests/_shared/fixtures/g3b-eR13B.json"
+
+[[test.validator.account]]
+address = "6LgSG6RUQF8mh9utzcUnqr5TtBJEPFA8Q6mt5D7VD5kU"  # G3-B1b fixture eR13Q
+filename = "tests/_shared/fixtures/g3b-eR13Q.json"
+
+[[test.validator.account]]
+address = "AgWGn1zbDX1ZxLDF9b7qVqCUoDhYEfgAVgFUjedNwK9G"  # G3-B1b fixture uR13
+filename = "tests/_shared/fixtures/g3b-uR13.json"
+
+[[test.validator.account]]
+address = "6vUnHDTEWGdYTdG3MQwZ1pp7xxzPje5TNGQGAuAFpNJg"  # G3-B1b fixture pR13
+filename = "tests/_shared/fixtures/g3b-pR13.json"
+
+[[test.validator.account]]
+address = "HAmuFXuJgWq7G4SrUurFSkSiXFr55FmM5KXYQXBDhbSA"  # G3-B1b fixture mC
+filename = "tests/_shared/fixtures/g3b-mC.json"
+
+# ---- G3-B2 (17-oct-2026): fixtures de génesis de la suite 91, caso 6 (gen-g3b2.mjs) ----
+[[test.validator.account]]
+address = "5vyX8jG6buqfFWovubfaefFDnRApsDCkW6jFGP5jWR9A"  # G3-B2 fixture vY
+filename = "tests/_shared/fixtures/g3b2-vY.json"
+
+[[test.validator.account]]
+address = "857Zh8MxscvxJaufC7pTCa5ytDckWAXiZeg5Soapcgym"  # G3-B2 fixture uY
+filename = "tests/_shared/fixtures/g3b2-uY.json"
+
+[[test.validator.account]]
+address = "EHo8VBer1fNpwdVAfmDsPNESosK7rzKD4qvMjWeZNyUC"  # G3-B2 fixture mP
+filename = "tests/_shared/fixtures/g3b2-mP.json"
+
+[[test.validator.account]]
+address = "HPRcsea96RWrTBBGMW1nrQhcS9FmmFPDDPhi3S5S6xap"  # G3-B2 fixture mT
+filename = "tests/_shared/fixtures/g3b2-mT.json"
+
+[[test.validator.account]]
+address = "7BtnfM8DtmZeKUQ27iTFBbt9FkmGbAKDyBw5c7R8tdvn"  # G3-B2 fixture aP
+filename = "tests/_shared/fixtures/g3b2-aP.json"
+
+[[test.validator.account]]
+address = "PxqN4VCbDfRjMjV4o7ayKsM4ahUFn4Ek8QTKayWDUmL"  # G3-B2 fixture aT
+filename = "tests/_shared/fixtures/g3b2-aT.json"
+
+[[test.validator.account]]
+address = "C8X3aBbfShyd5Dbx3sxGyDuia4LtTQ7xMpFgXNgJJp1i"  # G3-B2 fixture sY
+filename = "tests/_shared/fixtures/g3b2-sY.json"
+
+[[test.validator.account]]
+address = "5bgT5RoWEVsGvoBh8yn44wxUxsnPYGqAEj3tmyRp6gq6"  # G3-B2 fixture hY1
+filename = "tests/_shared/fixtures/g3b2-hY1.json"
+
+[[test.validator.account]]
+address = "A1u9PXGeZCzDNFapcybkpEhEXXDqQeN8LmRB6BswQcNF"  # G3-B2 fixture pY1
+filename = "tests/_shared/fixtures/g3b2-pY1.json"
+
+[[test.validator.account]]
+address = "AhwBgQrEuc6Af2Jvp2XLvx7Hw5GTZ27xdAYEmdErCX36"  # G3-B2 fixture hY2
+filename = "tests/_shared/fixtures/g3b2-hY2.json"
+
+[[test.validator.account]]
+address = "7qEkv5ynEgFTuSJcaGEk8Vfp5EYskX28Dm7TCVaVxzAN"  # G3-B2 fixture pY2
+filename = "tests/_shared/fixtures/g3b2-pY2.json"
+
+[[test.validator.account]]
+address = "E1t7Ttubq7voWj26wmDmn1dwStmiksAVRkxQjeSykro2"  # G3-B2 fixture tY2
+filename = "tests/_shared/fixtures/g3b2-tY2.json"
+
+[[test.validator.account]]
+address = "5gbe22Sc38V4PcNYmnCACsK1HHGraecSZczwekm7tviz"  # G3-B2 fixture vX
+filename = "tests/_shared/fixtures/g3b2-vX.json"
+
+[[test.validator.account]]
+address = "7Qu8ZxYtSpc2y6cYi8pcCcwGHKuYhyvqPkeM3PzJaNF8"  # G3-B2 fixture uX
+filename = "tests/_shared/fixtures/g3b2-uX.json"
+
+[[test.validator.account]]
+address = "6vz2kCtA4EMy9pJF4b3uMBc5HzpAhhAP72WspSHXnME7"  # G3-B2 fixture mPX
+filename = "tests/_shared/fixtures/g3b2-mPX.json"
+
+[[test.validator.account]]
+address = "A4mXtH47RroFR2qQrDdougAj6qPTWiCQjAKQo6S8wfyA"  # G3-B2 fixture aPX
+filename = "tests/_shared/fixtures/g3b2-aPX.json"
+
+[[test.validator.account]]
+address = "5QNuvS1UaVTjoywSTRnkchkfLC5e8SqMdub4U4vms6UY"  # G3-B2 fixture sX
+filename = "tests/_shared/fixtures/g3b2-sX.json"
+
+[[test.validator.account]]
+address = "A5qD93s6Xxq5Mssiwwdq5W9UBykFbe5qbUg5KRYafFWk"  # G3-B2 fixture sF
+filename = "tests/_shared/fixtures/g3b2-sF.json"
+
+[[test.validator.account]]
+address = "497PztguvaqyrBe2et64g3f6mepmZn4vjXJFoQ9sr7vc"  # G3-B2 fixture uF
+filename = "tests/_shared/fixtures/g3b2-uF.json"
+
+[[test.validator.account]]
+address = "G43Rkay9YHJXvzWZtFUy55givWEW4bG4xQHh5k5jqchx"  # G3-B2 fixture pF
+filename = "tests/_shared/fixtures/g3b2-pF.json"
+
+# G4 (F5B-01, 17-oct-2026): vault V7 de SIETE patas sin huchas para el retiro en UNA tx (suite 92). Generadas por
+# tests/_shared/fixtures/gen-g4.mjs (seeds fijas; los mints no se registran en el FeedRegistry).
+[[test.validator.account]]
+address = "69gDE4qrSmsDun7vjjA8XFutNR8pKMXh1PRE1VN8Da3D"  # G4 fixture vV7
+filename = "tests/_shared/fixtures/g4-vV7.json"
+
+[[test.validator.account]]
+address = "2qMNTZCwuaVb5L1ovmgg3o1cW8zMzfYenzqTSXXcxVGX"  # G4 fixture uV7
+filename = "tests/_shared/fixtures/g4-uV7.json"
+
+[[test.validator.account]]
+address = "21LRbzMFx6FqGqUGnZYH5wCpTMWxX1HNiUEskVUyrfVf"  # G4 fixture sV7
+filename = "tests/_shared/fixtures/g4-sV7.json"
+
+[[test.validator.account]]
+address = "B61JymAKiWeB5FVLvYhHJH9KgeNAA9RUVNHXfRnjUjgH"  # G4 fixture hS
+filename = "tests/_shared/fixtures/g4-hS.json"
+
+[[test.validator.account]]
+address = "7osw6fwdjr3yb8XMRgNyUCZjogsbkKdcQEVDSzW9spf5"  # G4 fixture pS
+filename = "tests/_shared/fixtures/g4-pS.json"
+
+[[test.validator.account]]
+address = "8RDqy9NAnwHNVDyKTwqbwKKRFwt3bot3E2boepTEuhNN"  # G4 fixture hN
+filename = "tests/_shared/fixtures/g4-hN.json"
+
+[[test.validator.account]]
+address = "kYFUmygeN33HdycC9QwY8f2TKhXUiTRfnj8QgPHby7o"  # G4 fixture pN
+filename = "tests/_shared/fixtures/g4-pN.json"
+
+[[test.validator.account]]
+address = "6qY8E6L2ikEVjqt8ixi1FjWMP9wrn2e1z9pEVbtPxgKP"  # G4 fixture m0
+filename = "tests/_shared/fixtures/g4-m0.json"
+
+[[test.validator.account]]
+address = "5RspwzyJpX5FgHV4VufeVGkNYgrZ5X4YNF72rrSPpUrs"  # G4 fixture a0
+filename = "tests/_shared/fixtures/g4-a0.json"
+
+[[test.validator.account]]
+address = "HZqAtc3UQbEi5F6bxeiS4KpEc4Ccwz5pDsubJhnVVLS2"  # G4 fixture m1
+filename = "tests/_shared/fixtures/g4-m1.json"
+
+[[test.validator.account]]
+address = "GSktXemfSrmYoLX1EyxbQ9oBrBLomMTJbM7iuYZHyLYA"  # G4 fixture a1
+filename = "tests/_shared/fixtures/g4-a1.json"
+
+[[test.validator.account]]
+address = "C3px8QMiKaVYtx5dxDo8isaLVXRV3rDCXJw4EQceUpqj"  # G4 fixture m2
+filename = "tests/_shared/fixtures/g4-m2.json"
+
+[[test.validator.account]]
+address = "ErT2nTYb6evHDH95KQEuaDjsxPQixrLxeiJTzK9C8yLd"  # G4 fixture a2
+filename = "tests/_shared/fixtures/g4-a2.json"
+
+[[test.validator.account]]
+address = "F7Esiwx3YTQpLZtGLo9jNAWNKxVUg79MGQwGJeMt6ey5"  # G4 fixture m3
+filename = "tests/_shared/fixtures/g4-m3.json"
+
+[[test.validator.account]]
+address = "D1w87uo4rZ1XF55ecfwUh67tBya334NWWBtUZrCtXWMH"  # G4 fixture a3
+filename = "tests/_shared/fixtures/g4-a3.json"
+
+[[test.validator.account]]
+address = "BAXQPgw5RBUmMRx2nLinHgRY6oMNC6douj6ahZJfhqdF"  # G4 fixture m4
+filename = "tests/_shared/fixtures/g4-m4.json"
+
+[[test.validator.account]]
+address = "BTvMqn1LpVLEhSkJMpiuvdypFsTtQ9sycfkRckxqwgmw"  # G4 fixture a4
+filename = "tests/_shared/fixtures/g4-a4.json"
+
+[[test.validator.account]]
+address = "5wvGnMK9a112hcX2GMZJZf6GM8HXW1bWbuNhxELZhpk6"  # G4 fixture m5
+filename = "tests/_shared/fixtures/g4-m5.json"
+
+[[test.validator.account]]
+address = "31oQQ8sp1BCNisZT2LN7RX8S2gn4FnAQtVrTPEMwAPWm"  # G4 fixture a5
+filename = "tests/_shared/fixtures/g4-a5.json"
+
+[[test.validator.account]]
+address = "9RQMEQar8zfh58UUsTfsT1xsFBtZmAWBT5SnYYrVBDba"  # G4 fixture m6
+filename = "tests/_shared/fixtures/g4-m6.json"
+
+[[test.validator.account]]
+address = "2f8HdgB8BTuV7frCrpqvJBTPn3QMjAdWiqF6PrXcZkXi"  # G4 fixture a6
+filename = "tests/_shared/fixtures/g4-a6.json"
+
+# G4 (suite 96): vault VT de tres patas (SPL, Token-2022 de confianza con TransferFee a 0 y Token-2022 de confianza congelado por
+# defecto) e inversor W. Generadas por tests/_shared/fixtures/gen-g4.mjs.
+[[test.validator.account]]
+address = "Hs6wGYudSTzQY9dmBKkehUHnWNN7sXhXvJdfHseYfvqN"  # G4 fixture vVT
+filename = "tests/_shared/fixtures/g4-vVT.json"
+
+[[test.validator.account]]
+address = "EknWoDVb1fx8AHZzW9Kdz3hxhaDA6vpL755k4w3c3LRm"  # G4 fixture uVT
+filename = "tests/_shared/fixtures/g4-uVT.json"
+
+[[test.validator.account]]
+address = "5aZ6fMYkMS4ZkWrW7woLq7Km8Ur4b6PX62ND5Hj9kDBQ"  # G4 fixture sVT
+filename = "tests/_shared/fixtures/g4-sVT.json"
+
+[[test.validator.account]]
+address = "4iLPu5Fp88YYu2BP6SHhWJjSC2zF3CbH4xPa41rXDbum"  # G4 fixture hW
+filename = "tests/_shared/fixtures/g4-hW.json"
+
+[[test.validator.account]]
+address = "Dde2pQZU78mmR3AxuTpHhDfuXfDe6EqtHf6j3s7NGEuZ"  # G4 fixture pW
+filename = "tests/_shared/fixtures/g4-pW.json"
+
+[[test.validator.account]]
+address = "EaH1yi3iWFVf1PqpcYZ1nu4g2hQzwZbo4XiQDnJmwPEm"  # G4 fixture mVC
+filename = "tests/_shared/fixtures/g4-mVC.json"
+
+[[test.validator.account]]
+address = "3A9XnpiiU2xvSStWUzSRzxwLmyvn4XSMBZQoT6LLwXDV"  # G4 fixture aVC
+filename = "tests/_shared/fixtures/g4-aVC.json"
+
+[[test.validator.account]]
+address = "9Sxfj8Yf9WLELbHmfny7QGZyGycqxgzQkpkQv2CY1yaT"  # G4 fixture mVT
+filename = "tests/_shared/fixtures/g4-mVT.json"
+
+[[test.validator.account]]
+address = "A89bNAD4YMbcpaRj1cQJYmfoLST5hTBWk9ktcdxM7dwk"  # G4 fixture aVT
+filename = "tests/_shared/fixtures/g4-aVT.json"
+
+[[test.validator.account]]
+address = "7octhPLPedgsVjyUuiyQTHJt7jjBZJ27qWaSyhaUP34j"  # G4 fixture mVD
+filename = "tests/_shared/fixtures/g4-mVD.json"
+
+[[test.validator.account]]
+address = "BDbfgSg9qJwKn8nFFFdGtLTbfAgRvWufKd9H27Ecs6Zg"  # G4 fixture aVD
+filename = "tests/_shared/fixtures/g4-aVD.json"
+
+[[test.validator.account]]
+address = "FniDG1SH5YHGnipYtZ9xjNmkRpN4SXjoaX7daR2k1oCf"  # G4 fixture dW
+filename = "tests/_shared/fixtures/g4-dW.json"
+
+[[test.validator.account]]
+address = "8ZiZjowFfDNUSJEdyGaTvnPi2DSFZm5UbQW1t1jD3AvB"  # G5 pyth 0 (precio 2000, expo 0)
+filename = "tests/_shared/fixtures/g5-pyth-0.json"
+
+[[test.validator.account]]
+address = "CMpHAf2wHsaYQ2jtjNPACL5pd8BiN3M4oqpyEugs5YVC"  # G5 pyth 1 (precio 2100, expo 0)
+filename = "tests/_shared/fixtures/g5-pyth-1.json"
+
+[[test.validator.account]]
+address = "5CVj7pdZ3dYd1RSU5JFZEJswcJNY9ohTYuKzBErX1pSd"  # G5 pyth 2 (precio 2200, expo 0)
+filename = "tests/_shared/fixtures/g5-pyth-2.json"
+
+[[test.validator.account]]
+address = "48fNXihSFWBSo4Dm7YfSWk9NfVjpDSFp4hBGwWHRVAUn"  # G5 pyth 3 (precio 2300, expo 0)
+filename = "tests/_shared/fixtures/g5-pyth-3.json"
+
+[[test.validator.account]]
+address = "D9WtE57Qswafr9MGnszKtJVvdnYphWtbq3xh5SebtKhz"  # G5 pyth 4 (precio 2400, expo 0)
+filename = "tests/_shared/fixtures/g5-pyth-4.json"
+
+[[test.validator.account]]
+address = "9Y1S3iYCQDktQjnjwn9KiWkpFhrrbC1GBNAurRWrikvk"  # G5 pyth 5 (precio 980, expo 0)
+filename = "tests/_shared/fixtures/g5-pyth-5.json"
+
+[[test.validator.account]]
+address = "32dwKk4SLVY6AoEDJ4V1Y27VcnK83x3ndARF4wUvj6BR"  # G5 pyth 6 (precio 990, expo 0)
+filename = "tests/_shared/fixtures/g5-pyth-6.json"
+
+[[test.validator.account]]
+address = "Cy3xM3LssHmQJSorVr5aG3rCeZGoDb5ZkY9TjPMvyqRr"  # tabla por vault fixture vW1
+filename = "tests/_shared/fixtures/tabla-vW1.json"
+
+[[test.validator.account]]
+address = "3LLkLYtFM4SGzirQ41gzK3k71msWAf7tL1HndJE5wDTb"  # tabla por vault fixture tT1
+filename = "tests/_shared/fixtures/tabla-tT1.json"
+
+[[test.validator.account]]
+address = "61NJ6Hy5YujrEVYZKpGMo79qoPwrkcqYhyWViiE7T1zb"  # tabla por vault fixture vW2
+filename = "tests/_shared/fixtures/tabla-vW2.json"
+
+[[test.validator.account]]
+address = "EszZRHCHXtwL39uqgmmF7mWsskQqpVT98t128vBYUEdz"  # tabla por vault fixture tT2
+filename = "tests/_shared/fixtures/tabla-tT2.json"
+
+[[test.validator.account]]
+address = "BVj21bAYb2UhrkxC9TyM1WtYkfbj9cmCg1rVJsJVKbvU"  # tabla por vault fixture vW3
+filename = "tests/_shared/fixtures/tabla-vW3.json"
+
+[[test.validator.account]]
+address = "D5tBaGhoCWygUHxHK4urARCq3SdJ29B9z2b87woh62Mj"  # tabla por vault fixture tT3
+filename = "tests/_shared/fixtures/tabla-tT3.json"
+
+[[test.validator.account]]
+address = "6UEWXjjk2d3hpCa8UitT6h3e2D6Pv8xHd5Yhh4R6AqL7"  # tabla por vault fixture vW4
+filename = "tests/_shared/fixtures/tabla-vW4.json"
+
+[[test.validator.account]]
+address = "okeki47MyztWuHLqsWMQ62NsuCbhhcYR7m8TXGUQqzZ"  # tabla por vault fixture tT4
+filename = "tests/_shared/fixtures/tabla-tT4.json"
+
+[[test.validator.account]]
+address = "FQpT6EuwLHRxfHXXUFg7TA6CEjextKnWiar98Nh3S7wC"  # tabla por vault fixture vW5
+filename = "tests/_shared/fixtures/tabla-vW5.json"
+
+[[test.validator.account]]
+address = "FRfCMqyPpPhQkoSkB9hicYEom8r8ocSH5DhH6EpJu4Ju"  # tabla por vault fixture tT5
+filename = "tests/_shared/fixtures/tabla-tT5.json"
+
+[[test.validator.account]]
+address = "2r1xoh34gk62vHdTNhkttbfpU6XkP6xyCorSrJo8RCeU"  # tabla por vault fixture vW6
+filename = "tests/_shared/fixtures/tabla-vW6.json"
+
+# Auditoría CISO (P4, #56) — fixtures de génesis del caso 3 de la suite 106 (gen-ciso-p4.mjs): vault P con la entrada
+# VETADA por un retiro en vuelo y la sesión V completa y sin barrer de hace más de 10 min (created_at 0).
+[[test.validator.account]]
+address = "496AUHZqgVSt9G3aNcy9Lx3nhe3Uwo5JbrXgnU1vzX8Z"  # CISO-P4 fixture vP
+filename = "tests/_shared/fixtures/ciso-p4-vP.json"
+
+[[test.validator.account]]
+address = "9NEWbDD6q9PNfdwXGLoErPqKty9m1W6irwSjZe8YXDND"  # CISO-P4 fixture uP
+filename = "tests/_shared/fixtures/ciso-p4-uP.json"
+
+[[test.validator.account]]
+address = "54E3Kw2TVXmsQAQr7otFQgFUpq1BcDG8WEfvhXsmGDJU"  # CISO-P4 fixture aM
+filename = "tests/_shared/fixtures/ciso-p4-aM.json"
+
+[[test.validator.account]]
+address = "4w3ykU5Er2bBw9DQ7YgsQfDY9StkRsWdeHUxeg1yEuJF"  # CISO-P4 fixture mM
+filename = "tests/_shared/fixtures/ciso-p4-mM.json"
+
+[[test.validator.account]]
+address = "4TsP3YKGb5AxuyoehipwKg7x65kkq8zPseRGBRsvCDhP"  # CISO-P4 fixture sV
+filename = "tests/_shared/fixtures/ciso-p4-sV.json"
+
+[[test.validator.account]]
+address = "9XDkQ5cTciB7nsYXHoSfqH97qvfPqwR4M63RuhXgfj3W"  # CISO-P4 fixture eV
+filename = "tests/_shared/fixtures/ciso-p4-eV.json"
+
+[[test.validator.account]]
+address = "86uV8qaZbCD8N5yorHoLPjDKuEDfbCGGVknCpbgJqg8V"  # CISO-P4 fixture uV
+filename = "tests/_shared/fixtures/ciso-p4-uV.json"

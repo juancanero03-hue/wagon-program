@@ -1,0 +1,52 @@
+name: remote-submit-job
+
+# Pide a OtterSec que compile desde el repo publico y verifique contra mainnet.
+# Solo lectura on-chain + llamada a la API de OtterSec; no firma nada.
+# Los argumentos del build (incluido `--arch v3`) los lee OtterSec de la cuenta
+# que registro export-pda-tx: aqui no se pasan.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  submit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Rust (para instalar solana-verify)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, pin por SHA
+        with:
+          toolchain: stable
+
+      - name: Instalar solana-verify (versión fijada)
+        run: |
+          set -euo pipefail
+          cargo install solana-verify --version 0.5.2 --locked
+          solana-verify --version
+
+      - name: Submit remote job a OtterSec
+        run: |
+          set -euo pipefail
+          solana-verify remote submit-job \
+            --program-id 2kZqCjGfKgVR8dUkv4PCogFsFgN3EoSSNX41HN1cBfBA \
+            --uploader 6YdqoAnM3498uyycJcSA7Pq2SXLrTk8UUB6L5voXnVyN \
+            -u https://api.mainnet-beta.solana.com
+
+      # solana-verify sale con 0 aunque OtterSec diga «Verification failed» (7-nov-2026): el veredicto se lee de su estado.
+      - name: El sello existe y es de ESTE commit
+        env:
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          curl -sS -f -m 30 https://verify.osec.io/status/2kZqCjGfKgVR8dUkv4PCogFsFgN3EoSSNX41HN1cBfBA -o estado.json
+          python3 - estado.json <<'PY'
+          import json, os, sys
+          d = json.load(open(sys.argv[1]))
+          print({k: d.get(k) for k in ("is_verified", "commit", "on_chain_hash", "executable_hash", "last_verified_at")})
+          ok = d.get("is_verified") is True and d.get("commit") == os.environ["COMMIT"] and d.get("on_chain_hash") == d.get("executable_hash")
+          print("SELLO OK" if ok else "::error::OtterSec no ha verificado este commit")
+          sys.exit(0 if ok else 1)
+          PY
